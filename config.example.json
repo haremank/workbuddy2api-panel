@@ -29,6 +29,12 @@
     "chat_base": "",
     "billing_base": ""
   },
+  "models": {
+    "extra_cn": [],
+    "extra_global": [],
+    "hide_cn": [],
+    "hide_global": []
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,

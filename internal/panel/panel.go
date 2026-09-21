@@ -17,6 +17,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,10 @@ type Config struct {
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
+	// BalanceRefreshInterval 返回后台余额刷新间隔（额度水位视图据此判定读数是否过期）；
+	// nil 时回落到 5 分钟。
+	BalanceRefreshInterval func() time.Duration
+
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 
@@ -60,6 +65,11 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ModelsCN / ModelsGlobal 模型名单的运维补充/屏蔽表（config.models，零值=不改动）。
+	// 与 /v1/models 同口径：面板「模型与档位」页看到的就是客户端实际拿到的名单。
+	ModelsCN     upstream.ModelOverrides
+	ModelsGlobal upstream.ModelOverrides
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -85,6 +95,11 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// 手动探针单例（probe.go）。**只在用户点「开始探测」时启动**——没有 ticker、
+	// 没有启动预热、不随额度刷新顺带跑。probeOnce 懒建。
+	probeOnce  sync.Once
+	probeState *probeJob
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -145,6 +160,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.mux.HandleFunc("GET /panel/api/quota", p.withAuth(p.quota))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
@@ -155,6 +171,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+	p.mux.HandleFunc("POST /panel/api/accounts/import", p.withAuth(p.accountsImport))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -176,6 +193,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	// 手动探针（probe.go）：点了才跑的真实可用性探测。没有后台定时任务——
+	// 用户明确要求"不要主动测试"，加定时器前先确认。
+	p.mux.HandleFunc("POST /panel/api/probe/start", p.withAuth(p.probeStart))
+	p.mux.HandleFunc("GET /panel/api/probe/status", p.withAuth(p.probeStatus))
+	p.mux.HandleFunc("POST /panel/api/probe/cancel", p.withAuth(p.probeCancel))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
@@ -234,6 +256,123 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// lowCreditsDefault 额度水位视图的「濒危」默认阈值：剩余积分低于此值即预警。
+// 取 50 是因为实测单次 chat 约消耗个位数积分，50 够十余次请求的余量；可用 ?low=N 覆盖。
+const lowCreditsDefault = 50
+
+// realmLabel 把内部 realm 标识转成面板展示名（与账号池的「国际版」标签同口径）。
+func realmLabel(realm string) string {
+	if realm == "global" {
+		return "国际版"
+	}
+	return "国内版"
+}
+
+// quota 额度水位：按 realm 汇总可用额度与可服务号数，并逐号列出余额/鲜度/冷却状态。
+//
+// 为什么需要它：上游对余额耗尽的账号一律回 429 + code 14018（Credits exhausted），
+// 而修复前该响应被判 ErrSoftRate（只软冷却 600s 便回池）⇒ 0 额度号被反复选中、
+// 每次必失败（2026-09-21 实测：global 池 49592dc4 / e5ecbb8b 反复出现在 429 soft_rate
+// 日志里）。选号侧的余额判据已根治该问题，本接口负责让它「看得见」：0 额度号、
+// 濒危号、读数过旧的号一眼可辨，不必翻日志。
+//
+// 查询参数：?low=N 覆盖濒危阈值（>=0，非法值忽略）；?realm=cn|global 只看一侧。
+func (p *Panel) quota(w http.ResponseWriter, r *http.Request) {
+	low := int64(lowCreditsDefault)
+	if v := strings.TrimSpace(r.URL.Query().Get("low")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			low = n
+		}
+	}
+	realmFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("realm")))
+	if realmFilter != "cn" && realmFilter != "global" {
+		realmFilter = ""
+	}
+
+	type realmAgg struct {
+		Realm      string `json:"realm"`
+		Label      string `json:"label"`
+		Accounts   int    `json:"accounts"`
+		Servable   int    `json:"servable"`
+		Zero       int    `json:"zero"`    // 余额已确认耗尽（选号已出池）
+		Low        int    `json:"low"`     // 0 < 余额 < 阈值
+		Unknown    int    `json:"unknown"` // 余额从未查到（数据不可信，仍参与选号）
+		Stale      int    `json:"stale"`   // 读数超过 3 个刷新周期未更新
+		Cooling    int    `json:"cooling"`
+		Disabled   int    `json:"disabled"`
+		Credits    int64  `json:"credits"`
+		CreditsCap int64  `json:"credits_total"`
+	}
+	aggs := map[string]*realmAgg{}
+	var order []string
+	accts := make([]pool.Status, 0)
+	staleAfter := 3 * p.balanceRefreshInterval()
+	now := time.Now()
+	for _, st := range p.cfg.Pool.List() {
+		realm := st.Realm
+		if realm == "" {
+			realm = "cn"
+		}
+		if realmFilter != "" && realm != realmFilter {
+			continue
+		}
+		accts = append(accts, st)
+		a := aggs[realm]
+		if a == nil {
+			a = &realmAgg{Realm: realm, Label: realmLabel(realm)}
+			aggs[realm] = a
+			order = append(order, realm)
+		}
+		a.Accounts++
+		a.Credits += st.Credits
+		a.CreditsCap += st.CreditsTotal
+		if st.Servable {
+			a.Servable++
+		}
+		if st.Cooling {
+			a.Cooling++
+		}
+		if st.Disabled {
+			a.Disabled++
+		}
+		switch {
+		case !st.CreditsKnown:
+			a.Unknown++
+		case st.Credits <= 0:
+			a.Zero++
+		case st.Credits < low:
+			a.Low++
+		}
+		if st.CreditsKnown && !st.CreditsUpdated.IsZero() && staleAfter > 0 &&
+			now.Sub(st.CreditsUpdated) > staleAfter {
+			a.Stale++
+		}
+	}
+	sort.Strings(order)
+	realms := make([]*realmAgg, 0, len(order))
+	for _, k := range order {
+		realms = append(realms, aggs[k])
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generated":     now.Format(time.RFC3339),
+		"low_threshold": low,
+		"stale_sec":     int64(staleAfter.Seconds()),
+		"realms":        realms,
+		"accounts":      accts,
+	})
+}
+
+// balanceRefreshInterval 返回后台余额刷新间隔；拿不到时回落到 5 分钟
+// （config.json 的 schedule.balance_refresh_minutes 默认值）。
+func (p *Panel) balanceRefreshInterval() time.Duration {
+	if p.cfg.BalanceRefreshInterval != nil {
+		if d := p.cfg.BalanceRefreshInterval(); d > 0 {
+			return d
+		}
+	}
+	return 5 * time.Minute
+}
+
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
@@ -242,16 +381,78 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
 // 无可用账号 503（先添加账号）；上游失败 502。
+//
+// realm 分池（2026-09-21 修，WB2API-REALM-FIX）：?realm=cn|global，缺省 cn（保持
+// 历史语义）。历史实现用无过滤的 Pick()，池里 global 号占多数时会抽到 global 号，
+// 面板「模型」页把 global 目录当 CN 目录显示（与 handler.fetchDynamicModels 同源 bug）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	acct := p.cfg.Pool.Pick()
-	if acct == nil {
+	realm := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("realm")))
+	if realm != "global" {
+		realm = "cn"
+	}
+	var infos []upstream.ModelInfo
+	noAcct := false
+	if realm == "global" {
+		acct := p.cfg.Pool.PickExcludingForRealm(nil, "", "global")
+		if acct == nil {
+			noAcct = true
+		} else {
+			infos = p.cfg.Upstream.FetchGlobalModelInfos(acct)
+			if len(infos) == 0 {
+				// 窄表形态 / 富字段缺失：退化为裸 ID 名单（不编造字段），与
+				// /v1/models 的 global 分支同口径；共享同一次探测缓存，零额外上游调用。
+				for _, id := range p.cfg.Upstream.FetchGlobalModels(acct) {
+					infos = append(infos, upstream.ModelInfo{ID: id})
+				}
+			}
+		}
+	} else {
+		acct := p.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
+		if acct == nil {
+			noAcct = true
+		} else {
+			var err error
+			infos, err = p.cfg.Upstream.FetchModels(acct)
+			if err != nil {
+				writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
+				return
+			}
+		}
+	}
+	if noAcct {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
-	infos, err := p.cfg.Upstream.FetchModels(acct)
-	if err != nil {
-		writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
-		return
+	// 运维补充/屏蔽表（config.models，零值=不改动）：与 /v1/models 同口径——
+	// 先按 Hide 剔除、再按 Extra 追加。面板展示的名单即客户端实际拿到的名单。
+	ov := p.cfg.ModelsCN
+	if realm == "global" {
+		ov = p.cfg.ModelsGlobal
+	}
+	if !ov.IsZero() {
+		ids := make([]string, 0, len(infos))
+		byID := make(map[string]upstream.ModelInfo, len(infos))
+		for _, mi := range infos {
+			ids = append(ids, mi.ID)
+			byID[mi.ID] = mi
+		}
+		res := make([]upstream.ModelInfo, 0, len(ids)+len(ov.Extra))
+		for _, id := range ov.Apply(ids) {
+			if mi, ok := byID[id]; ok {
+				res = append(res, mi)
+				continue
+			}
+			// 补充项：三级查找（本 realm 全量目录 → CN 同名回落 → 静态种子表），
+			// 与 /v1/models 共用 upstream.Client.CatalogOrSeed **同一份实现**。
+			// 🔴 不要在这里再内联一份 —— 2026-09-21 round6 就因为 handler/panel
+			// 各写一份，给 handler 加第三级时漏改面板，导致两侧字段不一致。
+			if mi, ok := p.cfg.Upstream.CatalogOrSeed(realm, id); ok {
+				res = append(res, mi)
+				continue
+			}
+			res = append(res, upstream.ModelInfo{ID: id}) // 三级全查不到：裸 ID（不编造字段）
+		}
+		infos = res
 	}
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
@@ -284,7 +485,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
 			entry["max_output_tokens"] = mo
 		}
-		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+		if efforts, def := upstream.EffortListing(realm, mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
 			entry["supported_efforts"] = efforts
 			if def != "" {
 				entry["default_effort"] = def
@@ -292,7 +493,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "realm": realm, "models": out})
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out

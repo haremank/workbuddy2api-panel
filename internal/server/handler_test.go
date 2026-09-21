@@ -772,6 +772,50 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	}
 }
 
+// TestChat14003WithoutResetCoolsModelOnly 14003（global 模型级限流，实测无重置文案）
+// → **只冻该模型、不冻整号**：账号不 Cooling、台账单行、同号其它模型仍可选。
+// 旧实现把它归账号级，整号冻结 soft_rate（默认 60s），而同号其它模型其实健康
+// ——「接入国际版模型老是没反应」的第二根因。
+func TestChat14003WithoutResetCoolsModelOnly(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			// 真实上游 body（2026-09-21 实测）。
+			return 429, `{"code":14003,"msg":"too many requests","requestId":"6aee411208ca8e358f8bf65eae8333fd"}`, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"hy4-preview","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("bad")
+	if st.Cooling {
+		t.Errorf("14003 是模型级限流，账号不应 Cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "hy4-preview" {
+		t.Fatalf("want 单行模型级台账 hy4-preview，got %+v", st.RateLimitedModels)
+	}
+	if !st.RateLimitedModels[0].ResetAt.IsZero() {
+		t.Errorf("ResetAt=%v 应为零值（上游没给恢复时刻，不得编造）", st.RateLimitedModels[0].ResetAt)
+	}
+	// 该模型对 bad 已冷却 → 选号必须避开；换模型则 bad 仍可用（模型级豁免）。
+	if got := p.PickExcludingForModel(nil, "hy4-preview"); got == nil || got.UID != "good" {
+		t.Errorf("hy4-preview 选号应避开 bad（模型级冷却），got %+v", got)
+	}
+	if got := p.PickExcludingForModel(nil, "deepseek-v4.1-flash"); got == nil {
+		t.Error("换模型后 bad 应仍可被选中（模型级豁免）")
+	}
+}
+
 func TestChatAllUnavailableReturns503(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 402, `{"code":1,"msg":"余额不足"}`, false

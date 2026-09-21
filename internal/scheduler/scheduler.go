@@ -492,6 +492,12 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 	}()
 }
 
+// BalanceInterval 返回当前余额刷新间隔（0 = 暂停）。面板额度水位视图据此判定读数
+// 鲜度（超过 3 个刷新周期未更新即提示"数据过旧"）。只读，并发安全。
+func (s *Scheduler) BalanceInterval() time.Duration {
+	return time.Duration(s.balanceInterval.Load())
+}
+
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
 func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 	if d < 0 {

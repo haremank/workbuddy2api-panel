@@ -58,6 +58,21 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
+		// 429 + 精确计费耗尽 code（14018 Credits exhausted）：上游用 429 承载余额
+		// 耗尽，必须先于 429 限流兜底判为 ErrHardCredit——否则只软冷却一个 soft_rate
+		// （600s）便回池，0 额度号被反复选中且每次必失败（2026-09-21 实测诊断）。
+		// 真实 body 原文（含 error.data 信封）。
+		{429, `{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link below to purchase add-on packs."}}}`, ErrHardCredit},
+		{429, `{"error":{"data":{"code": 14018,"msg":"Credits exhausted"}}}`, ErrHardCredit}, // JSON 空格容差
+		{429, `{"error":{"data":{"code":"14018"}}}`, ErrHardCredit},                          // 字符串形式 code
+		// 429 + 其他业务 code：不受影响，仍走限流兜底（14003 too many requests / 6004 模型级）。
+		{429, `{"error":{"data":{"code":14003,"msg":"Too many requests"}}}`, ErrSoftRate},
+		{429, `{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, ErrSoftRate},
+		// 429 + 模糊计费措辞（**无** 14018 code）：保持既有语义 → 限流。
+		// 这正是"只认精确 code、不认关键词"的取舍：429 body 高频混用 quota 措辞，
+		// 按关键词判会把限流误归硬冷却（白扔号约 12h）。宁可漏判，不可误判。
+		{429, `{"code":1,"msg":"quota exceeded"}`, ErrSoftRate},
+		{429, `credits exhausted`, ErrSoftRate},
 	}
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
@@ -66,22 +81,99 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
+// TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004 / 14003）。
 func TestIsModelRateLimit(t *testing.T) {
 	cases := []struct {
 		body string
 		want bool
 	}{
-		// 6004：模型级限流（issue #31 的核心场景）。
+		// 6004：CN 的模型级限流（issue #31 的核心场景），msg 带中文重置文案。
 		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, true},
 		{`{"code": 6004,"msg":"x"}`, true},
+		{`{"code":"6004"}`, true}, // 字符串形式 code
+		// 14003：global 的模型级限流（2026-09-21 实测真实 body），**无重置文案**。
+		{`{"code":14003,"msg":"too many requests","requestId":"7424742c-37b5-40ed-bbc4-7badb4dae0a6"}`, true},
+		{`{"code": 14003}`, true},
+		{`{"code":"14003"}`, true},
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
+		// 14018 是账号级额度耗尽（Classify 已先判 ErrHardCredit）——不得被当成模型级。
+		{`{"error":{"data":{"code":14018,"msg":"Credits exhausted."}}}`, false},
+		{`{"code":11102}`, false},
+		// 数字边界：更长的 code 不得被前缀误命中（RE2 无 lookahead，靠 (?:[^0-9]|$)）。
+		{`{"code":60040}`, false},
+		{`{"code":140030}`, false},
+		{`{"code":"140030"}`, false},
+		// code 出现在非 code 字段（如 requestId）不应误命中。
+		{`{"requestId":"14003","code":1}`, false},
+		// 末尾即 code 结尾（无后续字符）仍应命中。
+		{`{"code":14003}`, true},
 	}
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
 			t.Errorf("IsModelRateLimit(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// TestModelRateLimitCode 返回命中的模型级限流 code（供 applyErrorPolicy 生成原因）。
+func TestModelRateLimitCode(t *testing.T) {
+	cases := []struct {
+		body string
+		want string
+	}{
+		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, "6004"},
+		{`{"code":14003,"msg":"too many requests"}`, "14003"},
+		{`{"code": 14003}`, "14003"},
+		{`{"code":"14003"}`, "14003"},
+		// 非模型级 → 空串（调用方据此回落账号级）。
+		{`{"code":14018,"msg":"Credits exhausted."}`, ""},
+		{`{"code":1,"msg":"429 rate limit"}`, ""},
+		{`{"code":140030}`, ""},
+		{``, ""},
+	}
+	for _, c := range cases {
+		if got := ModelRateLimitCode(c.body); got != c.want {
+			t.Errorf("ModelRateLimitCode(%q)=%q want %q", c.body, got, c.want)
+		}
+	}
+}
+
+// TestIsBillingExhausted 判断 body 是否明确指向计费余额耗尽（业务 code 14018）。
+// 该谓词被 Classify 用在 429 兜底之前：只认精确 code，模糊计费措辞一律不认。
+func TestIsBillingExhausted(t *testing.T) {
+	cases := []struct {
+		body string
+		want bool
+	}{
+		// 真实上游 body（2026-09-21 实测，HTTP 429 承载）。
+		{`{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link below to purchase add-on packs."}}}`, true},
+		{`{"error":{"data":{"code": 14018}}}`, true}, // JSON 空格容差
+		{`{"code":"14018"}`, true},                   // 字符串形式
+		// 其他业务 code / 无 code：不认（交回 429 限流兜底）。
+		{`{"error":{"data":{"code":14003,"msg":"Too many requests"}}}`, false},
+		{`{"error":{"data":{"code":6004}}}`, false},
+		{`{"error":{"data":{"code":14017,"msg":"trial not activated"}}}`, false},
+		// 模糊计费措辞：**故意不认**——429 body 高频混用 quota 措辞，
+		// 按关键词判会把限流误归硬冷却（白扔号约 12h）。漏判只损失一个号，
+		// 误判损失 12 小时额度。
+		{`{"code":1,"msg":"quota exceeded"}`, false},
+		{`credits exhausted`, false},
+		{`积分不足`, false},
+		{``, false},
+		// 14018 出现在非 code 字段（如 requestId）不应误命中。
+		{`{"requestId":"14018","code":14003}`, false},
+		// 数字边界：更长的 code（140180）不得被 14018 前缀误命中
+		// （RE2 无 lookahead，靠 (?:[^0-9]|$) 断言）。
+		{`{"code":140180}`, false},
+		{`{"code":"140180"}`, false},
+		// 末尾即 code 结尾（无后续字符）仍应命中。
+		{`{"code":14018}`, true},
+	}
+	for _, c := range cases {
+		if got := IsBillingExhausted(c.body); got != c.want {
+			t.Errorf("IsBillingExhausted(%q)=%v want %v", c.body, got, c.want)
 		}
 	}
 }
@@ -101,6 +193,15 @@ func TestParseSoftRateReset(t *testing.T) {
 		{"非 6004 但带时间（ParseRateReset 统一解析；模型级豁免由调用侧按 6004 判定）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
+		// ── 英文文案（global realm）：2026-09-21 用户实测报文 ──────────────
+		// 中文正则必然失配 ⇒ 修复前 ParseRateReset 返回 false ⇒ 静默退回有界退避。
+		{"英文 will reset at + UTC+8（global 实测全文）",
+			`{"error":{"data":{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at ` + ts + ` UTC+8, alternatively, you can switch to the other models to continue using it."}}}`, true},
+		{"英文 will reset at 无时区后缀", `{"code":6004,"msg":"your usage will reset at ` + ts + `"}`, true},
+		{"英文 RFC3339 T 分隔", `{"code":6004,"msg":"your usage will reset at ` + strings.Replace(ts, " ", "T", 1) + ` UTC+8"}`, true},
+		{"英文 resets at 复数形式", `{"code":6004,"msg":"quota resets at ` + ts + `"}`, true},
+		{"英文无时间戳（不得臆造）", `{"code":6004,"msg":"usage exceeds frequency limit, please switch to the other models"}`, false},
+		{"英文 reset at 后非时间戳不得吞文本", `{"code":6004,"msg":"reset at your own risk"}`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

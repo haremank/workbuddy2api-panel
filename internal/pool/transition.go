@@ -62,5 +62,7 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
 	e.credits = credits
 	e.creditsTotal = total
+	e.creditsKnown = true // 余额已由成功查询确认（选号余额判据据此生效）
+	e.creditsUpdated = time.Now()
 	e.clearCoolingLocked()
 }

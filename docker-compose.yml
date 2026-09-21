@@ -13,8 +13,13 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
+    # 监听地址：**默认只绑本机**（127.0.0.1）。不要把具体地址写死在这里 ——
+    # 别人 clone 本项目后若绑到一个本机不存在的网卡，容器会直接起不来。
+    # 需要对外提供服务时，用同目录的 .env 覆盖（.env 已被 .gitignore 忽略）：
+    #   WB2API_BIND=<本机内网/VPN 地址>   仅该网卡可达（推荐：配合 tailnet/安全组）
+    #   WB2API_BIND=0.0.0.0               所有网卡（务必自行确保有防火墙）
     ports:
-      - "7863:7863"
+      - "${WB2API_BIND:-127.0.0.1}:7863:7863"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data

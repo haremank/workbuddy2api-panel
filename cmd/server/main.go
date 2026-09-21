@@ -243,10 +243,21 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// 额度水位视图的读数鲜度判据（超过 3 个刷新周期未更新即提示"数据过旧"）。
+		// sch 为 nil（未启用调度）时返回 0 → 面板回落 5 分钟默认值。
+		BalanceRefreshInterval: func() time.Duration {
+			if sch == nil {
+				return 0
+			}
+			return sch.BalanceInterval()
+		},
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
+		// 模型名单补充/屏蔽表（config.models）：面板与 /v1/models 同口径。
+		ModelsCN:     upstream.ModelOverrides{Extra: cfg.Models.ExtraCN, Hide: cfg.Models.HideCN},
+		ModelsGlobal: upstream.ModelOverrides{Extra: cfg.Models.ExtraGlobal, Hide: cfg.Models.HideGlobal},
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -272,7 +283,10 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
-		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		// 模型名单补充/屏蔽表（config.models）：抹平"上游目录 ≠ 实际可调"。
+		ModelsCN:     upstream.ModelOverrides{Extra: cfg.Models.ExtraCN, Hide: cfg.Models.HideCN},
+		ModelsGlobal: upstream.ModelOverrides{Extra: cfg.Models.ExtraGlobal, Hide: cfg.Models.HideGlobal},
+		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
 	chatHandler = h
 
@@ -414,6 +428,11 @@ func restartRequiredFields(c *Config) []string {
 		out = append(out, "upstash")
 	}
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	// models.* 在装配期被注入 handler/panel（值拷贝），改后需重启才生效。
+	if len(c.Models.ExtraCN) > 0 || len(c.Models.ExtraGlobal) > 0 ||
+		len(c.Models.HideCN) > 0 || len(c.Models.HideGlobal) > 0 {
+		out = append(out, "models")
+	}
 	return out
 }
 

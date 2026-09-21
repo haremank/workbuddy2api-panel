@@ -140,6 +140,13 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			sessionDeadFails: s.SessionDeadFails,
 			consecutiveFails: s.ConsecutiveFails,
 		}
+		// creditsKnown：优先用持久化字段；旧 state 文件无该字段（false）时按
+		// CreditsTotal > 0 兜底推断——口径与 stateAccount.CreditsTotal 的注释一致
+		// （0 = 未知 / 旧 state）。重启后余额判据必须立刻生效，否则 0 额度号会在
+		// 重启后重新混入轮换。反例保护：两者都取不到时视为未知，不据 credits==0 出池。
+		e.creditsKnown = s.CreditsKnown || s.CreditsTotal > 0
+		// creditsUpdated 只做信息恢复（面板鲜度显示）；零值 = 从未查询过，不改判定。
+		e.creditsUpdated = s.CreditsUpdated
 		// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 		// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
 		if s.BreakerUntil != nil && now.Before(*s.BreakerUntil) {
@@ -242,6 +249,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		s := stateAccount{
 			Credits:          e.credits,
 			CreditsTotal:     e.creditsTotal,
+			CreditsKnown:     e.creditsKnown,
+			CreditsUpdated:   e.creditsUpdated,
 			Disabled:         e.disabled,
 			Reason:           e.reason,
 			Until:            e.until,

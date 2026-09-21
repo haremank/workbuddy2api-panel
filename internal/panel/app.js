@@ -3,9 +3,13 @@
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
-let overviewData = null, cfgLoaded = null;
+let overviewData = null, cfgLoaded = null, quotaData = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+// 手动探针状态。**必须在 go() 首次调用之前声明**：首屏 hash 若是 #quota，
+// go() → pbInit()/loadQuota() → pbRenderAccts() 会立刻读到这些绑定；
+// 用 let 声明在后面会撞 TDZ（ReferenceError），页面白屏。
+let pbStatus = null, pbTimer = null;
 
 const $ = id => document.getElementById(id);
 
@@ -126,7 +130,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', quota: '额度水位', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -135,6 +139,7 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
+  if (v === 'quota') { loadQuota(); pbInit(); }
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
@@ -159,8 +164,13 @@ function renderAccounts(list) {
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (cool > 0) {
       cls = 'cool';
+      // cool_kind 三档：hard_credit 真实流量撞 14018 / probe_verdict 探针实测额度耗尽
+      // （12h 有效）/ 其余为限流软冷却。探针结论单列一档，运维才看得出"这是探针判的、
+      // 到期会自己回来"，而不是把它当成正在限流。
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
-        : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
+        : (dg > (s.cool_remaining_sec || 0) ? '连败降权'
+          : (s.cool_kind === 'hard_credit' ? '额度冷却'
+            : (s.cool_kind === 'probe_verdict' ? '探针判定' : '限流冷却')));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
@@ -171,7 +181,10 @@ function renderAccounts(list) {
       : Math.round((s.credits || 0) / maxCred * 100);
     // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
     // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
-    let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    // 口径：credits 是**全部套餐剩余之和**（含免费额度 / Free Plan Subscription，
+    // 按 CycleCapacityRemain 读），不是「已购积分」——0 已购积分但有免费额度的号
+    // 仍有值，不会被选号器摘出。措辞必须写「可用额度」避免运维误判。
+    let credTip = s.credits_total > 0 ? '可用额度 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '可用额度（相对池内最高）';
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
@@ -316,10 +329,13 @@ function outCell(m, pr) {
 
 async function loadModels() {
   const tb = $('mdBody');
+  // realm 分池（2026-09-21 修，WB2API-REALM-FIX）：CN 与 global 的目录由各自的
+  // 账号拉取，必须显式指定 realm，否则服务端缺省 cn、国际版目录看不到。
+  const realm = ($('mdRealm') && $('mdRealm').value) || 'cn';
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
+    const [d, pr] = await Promise.all([api('models?realm=' + encodeURIComponent(realm)), api('model_probes').catch(() => ({}))]);
     const list = d.models || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
@@ -346,12 +362,14 @@ async function loadModels() {
         outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
     const hit = list.filter(m => probeOf(m.id)).length;
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    $('mdNote').textContent = (realm === 'global' ? 'global · 国际版' : 'CN · 国内版') + ' · ' + list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
 $('btnModels').onclick = loadModels;
+// realm 切换即重查（两域目录来源不同，不能复用上一次结果）。
+if ($('mdRealm')) $('mdRealm').onchange = loadModels;
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
@@ -570,6 +588,360 @@ $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 
+/* ── 导入账号 JSON ─────────────────────────────────────────────────── */
+// 后端 /panel/api/accounts/import 接受原始 JSON 文本（不解析结构，直接转发），
+// 支持切换器导出形与 auths 原生形；dry_run=1 只校验不落盘，用于「预览」。
+function openImport() {
+  $('impVeil').classList.add('on');
+  $('impState').hidden = true;
+  $('impList').hidden = true;
+  $('impList').innerHTML = '';
+  $('btnImpRun').disabled = false;
+  $('btnImpPreview').disabled = false;
+}
+function closeImport() { $('impVeil').classList.remove('on'); }
+function impBusy(on) {
+  $('btnImpRun').disabled = on;
+  $('btnImpPreview').disabled = on;
+}
+function impState(msg, cls) {
+  const el = $('impState');
+  el.hidden = false;
+  el.className = 'state ' + (cls || '');
+  el.textContent = msg;
+}
+// 渲染逐条结果表：uid / 昵称 / 域 / 结果 / 失败原因。
+function impRender(r) {
+  const rows = (r.accounts || []).map(a => {
+    const st = a.status === 'error' ? '失败' : (a.status === 'updated' ? '覆盖' : '新增');
+    const cls = 'st-' + (a.status || 'error');
+    return '<tr><td>' + esc(a.uid || '—') + '</td><td>' + esc(a.nickname || '—') + '</td><td>'
+      + esc(a.realm || '—') + '</td><td class="' + cls + '">' + st + '</td><td>'
+      + esc(a.error || '') + '</td></tr>';
+  }).join('');
+  $('impList').innerHTML = '<table><thead><tr><th>uid</th><th>昵称</th><th>域</th><th>结果</th><th>说明</th></tr></thead><tbody>'
+    + rows + '</tbody></table>';
+  $('impList').hidden = false;
+}
+async function impRun(dryRun) {
+  const text = $('impText').value.trim();
+  if (!text) { impState('请先粘贴 JSON 或选择文件', 'err'); return; }
+  impBusy(true);
+  impState(dryRun ? '校验中…' : '导入中…');
+  try {
+    const r = await api('accounts/import' + (dryRun ? '?dry_run=1' : ''),
+      { method: 'POST', body: text });
+    impRender(r);
+    const sum = '共 ' + r.total + ' 条：新增 ' + r.added + ' · 覆盖 ' + r.updated + ' · 失败 ' + r.failed;
+    impState((dryRun ? '预览完成（未写入）— ' : '导入完成 — ') + sum, r.failed ? 'err' : 'ok');
+    if (!dryRun) {
+      toast('导入完成：新增 ' + r.added + ' · 覆盖 ' + r.updated + (r.failed ? ' · 失败 ' + r.failed : ''), r.failed ? 'err' : 'ok');
+      loadOverview(true);
+    }
+  } catch (e) {
+    impState('失败：' + e.message, 'err');
+  } finally { impBusy(false); }
+}
+$('btnImport').onclick = openImport;
+$('btnImpClose').onclick = closeImport;
+$('btnImpPreview').onclick = () => impRun(true);
+$('btnImpRun').onclick = () => impRun(false);
+$('impFile').onchange = e => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => { $('impText').value = String(rd.result || ''); impState('已载入 ' + f.name + '（' + Math.round(f.size / 1024) + ' KB），点「预览」先校验', 'ok'); };
+  rd.onerror = () => impState('读取文件失败：' + f.name, 'err');
+  rd.readAsText(f);
+};
+
+/* ── 额度水位 ─────────────────────────────────────────────────────── */
+/* 回答"还有多少额度、哪些号已经耗尽"。上游对 0 余额账号一律回 429 + 14018
+   （Credits exhausted），修复前会被误判成限流、只软冷却 600s 便回池 ⇒ 反复被选中
+   且每次必失败。选号侧已加余额判据根治；本视图让它在面板上先暴露出来。
+   判据三态：credits_known=true 且 credits<=0 → 已耗尽（已出池）；
+   credits_known=false → 读数未知（仍参与选号，可能不准）。
+
+   ⚠️ 「额度」口径（2026-09-21 实测定论）：credits = 上游**全部套餐剩余之和**，
+   含 Free Plan Subscription 的免费额度（读 CycleCapacityRemain，而不是恒等于面额的
+   CapacityRemain）。所以「0 **已购**积分但有免费额度」的号 credits > 0、不会被摘出
+   ——「免费模型哪怕 0 积分也能用」说的正是这种号。反之 credits 真为 0（所有套餐都烧光）
+   的号，连 0x 免费档（hy3 / hy4-preview-f / deepseek-v4.1-flash）也回 14018：
+   上游的额度闸门是**账号级**的，免费档不豁免。故文案统一用「可用额度」而非「积分」。 */
+async function loadQuota(quiet) {
+  try {
+    quotaData = await api('quota');
+    renderQuota(quotaData);
+    pbRenderAccts();   // 账号勾选随账号池更新（只在账号集合变化时重建）
+  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+}
+
+function renderQuota(d) {
+  const realms = d.realms || [], list = d.accounts || [];
+  const low = d.low_threshold == null ? 50 : d.low_threshold;
+  const staleSec = d.stale_sec || 900;
+  const isZero = s => s.credits_known && (s.credits || 0) <= 0;
+  const isLow = s => s.credits_known && (s.credits || 0) > 0 && s.credits < low;
+  const isStale = s => s.credits_known && s.credits_updated &&
+    (Date.now() - new Date(s.credits_updated)) / 1000 > staleSec;
+  const unknown = list.filter(s => !s.credits_known).length;
+  const servable = list.filter(s => s.servable).length;
+
+  $('qStats').innerHTML = realms.map(r => {
+    const cls = r.credits <= 0 ? 'bad' : ((r.zero || 0) > 0 ? 'warn' : 'good');
+    const cap = r.credits_total > 0 ? ' / ' + r.credits_total : '';
+    return '<div class="stat ' + cls + '"><div class="v">' + r.credits + cap + '</div>' +
+      '<div class="k">' + esc(r.label || r.realm) + ' 剩余' + (r.credits_total > 0 ? ' / 总额' : '') + '</div></div>';
+  }).join('') +
+    '<div class="stat bad"><div class="v">' + list.filter(isZero).length + '</div><div class="k">0 额度（已出池）</div></div>' +
+    '<div class="stat warn"><div class="v">' + list.filter(isLow).length + '</div><div class="k">濒危（&lt; ' + low + '）</div></div>' +
+    '<div class="stat"><div class="v">' + servable + ' / ' + list.length + '</div><div class="k">此刻可选</div></div>' +
+    '<div class="stat"><div class="v">' + (list.filter(isStale).length + unknown) + '</div><div class="k">读数过期 / 未知</div></div>';
+
+  $('qNote').textContent = d.generated ? '读数 ' + ago(d.generated) : '';
+
+  if (!list.length) {
+    $('qBody').innerHTML = '<tr><td colspan="7"><div class="empty"><div class="big">账号池是空的</div>先在「账号池」里添加账号</div></td></tr>';
+    return;
+  }
+  // 排序：先按域（cn → global），域内按余额升序 —— 最危险的排最上面。
+  const sorted = list.slice().sort((a, b) => {
+    const ar = a.realm || 'cn', br = b.realm || 'cn';
+    if (ar !== br) return ar < br ? -1 : 1;
+    return (a.credits || 0) - (b.credits || 0);
+  });
+  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
+  $('qBody').innerHTML = sorted.map(s => {
+    const cr = s.credits || 0, cap = s.credits_total || 0;
+    const pct = cap > 0 ? Math.min(100, Math.round(cr / cap * 100)) : Math.round(cr / maxCred * 100);
+    let cls = '', tag;
+    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    else if (isZero(s)) { cls = 'off'; tag = '<span class="tag bad">额度耗尽 · 已出池</span>'; }
+    else if (s.cooling) {
+      cls = 'cool';
+      tag = '<span class="tag warn">冷却中 · ' + dur(s.cool_remaining_sec || 0) + '</span>';
+    } else if (!s.credits_known) { cls = 'cool'; tag = '<span class="tag">读数未知</span>'; }
+    else if (isLow(s)) { cls = 'cool'; tag = '<span class="tag warn">濒危</span>'; }
+    else tag = '<span class="tag ok">可用</span>';
+    if (isStale(s)) tag += '<span class="tag warn">数据过旧</span>';
+
+    const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
+    const cred = cap > 0 ? cr + '<span class="of">/' + cap + '</span>' : String(cr);
+    const tip = (cap > 0 ? '剩余 ' + cr + ' / 总额 ' + cap + '（' + pct + '%）' : '剩余 ' + cr) +
+      (s.credits_updated ? '\n读数时间：' + new Date(s.credits_updated).toLocaleString() : '\n读数时间：从未成功查询') +
+      (s.reason ? '\n状态：' + s.reason : '');
+    const rlm = (s.rate_limited_models || []).map(m =>
+      esc(m.model) + (m.until ? '（至 ' + new Date(m.until).toLocaleString() + '）' : '')).join('、');
+    const cool = s.cooling
+      ? esc(s.cool_kind || '-') + ' · ' + dur(s.cool_remaining_sec || 0)
+      : (rlm ? '模型限额：' + rlm : '—');
+    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td>' + (s.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '国内版') + '</td>' +
+      '<td class="cred" title="' + esc(tip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td>' + tag + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">' + (s.credits_updated ? ago(s.credits_updated) : '从未') + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">' + cool + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+$('btnQuotaRefresh').onclick = async () => {
+  const b = $('btnQuotaRefresh');
+  b.disabled = true; b.textContent = '刷新中…';
+  try {
+    await api('balance_all', { method: 'POST' });
+    await loadQuota(true);
+    toast('余额已从上游刷新', 'ok');
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadQuota(true); }
+  finally { b.disabled = false; b.textContent = '立即刷新余额'; }
+};
+
+/* ── 手动探针 ─────────────────────────────────────────────────────── */
+/* 用户要求（2026-09-21）：额度界面改成**手动**探针 —— 点了才跑、真实调用、结果实时
+   更新到界面、**不要主动测试**。所以这里：
+     · 没有任何定时器在"跑探针"；pbTimer 只在 running 期间存在，跑完立刻清掉。
+     · 进入本页只做一次只读的 probe/status（用于回填模型预填 + 显示上次结果），
+       不会触发任何上游调用。
+     · 账号勾选只在账号集合变化时重建，避免 5s 轮询把用户的勾选冲掉。
+   默认探测档按 **realm** 分流（国内/国际不一样，用户 2026-09-21 指定），所以模型框
+   **留空是推荐用法** —— 由后端按每个账号所属域取 default_models，JS 只负责把这份
+   默认说明显示出来（抄一份到 JS 里必漂移）。 */
+
+function pbModelsList() {
+  return ($('pbModels').value || '').split('\n').map(s => s.trim()).filter(Boolean);
+}
+function pbSelectedUids() {
+  return Array.prototype.map.call(
+    document.querySelectorAll('#pbAccts input[type=checkbox]:checked'), c => c.value);
+}
+function pbRenderAccts() {
+  const list = (quotaData && quotaData.accounts) || [];
+  const box = $('pbAccts');
+  if (!box) return;
+  const sig = list.map(s => s.uid).join(',');
+  if (box.dataset.sig === sig) { pbPlan(); return; }
+  box.dataset.sig = sig;
+  if (!list.length) { box.innerHTML = '<span class="hint">账号池是空的</span>'; pbPlan(); return; }
+  box.innerHTML = list.map(s => {
+    const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
+    const nm = s.nickname ? esc(s.nickname) : esc(short);
+    const rl = s.realm === 'global' ? '国际' : '国内';
+    return '<label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer">' +
+      '<input type="checkbox" value="' + esc(s.uid) + '" checked>' +
+      '<span>' + nm + '</span><span class="hint" style="font-size:11px">' + rl + '</span></label>';
+  }).join('');
+  Array.prototype.forEach.call(box.querySelectorAll('input'), c => c.onchange = pbPlan);
+  pbPlan();
+}
+// pbPairCount 与后端 probeStart 的组合展开规则保持一致：
+//   · `realm:` 前缀只在该域账号上跑
+//   · **模型留空时按账号所属 realm 取 default_models**（后端 probeRealmModels 的镜像）
+function pbPairCount() {
+  const list = (quotaData && quotaData.accounts) || [];
+  const uids = new Set(pbSelectedUids());
+  const models = pbModelsList();
+  const dm = (pbStatus && pbStatus.default_models) || {};
+  let n = 0;
+  list.forEach(s => {
+    if (!uids.has(s.uid)) return;
+    const realm = s.realm || 'cn';
+    const specs = models.length ? models : (dm[realm] || []);
+    specs.forEach(m => {
+      const i = m.indexOf(':');
+      const pre = i > 0 ? m.slice(0, i) : '';
+      if (pre && pre !== realm) return;
+      n++;
+    });
+  });
+  return n;
+}
+// pbDefaultSummary 把 default_models 说成一句人话（国内/国际各探什么）。
+function pbDefaultSummary() {
+  const dm = (pbStatus && pbStatus.default_models) || {};
+  const keys = Object.keys(dm).sort();
+  if (!keys.length) return '（未知）';
+  return keys.map(k => (k === 'global' ? '国际' : '国内') + ' ' + dm[k].join(' + ')).join('；');
+}
+function pbPlan() {
+  const el = $('pbPlan');
+  if (!el) return;
+  const n = pbPairCount();
+  const max = (pbStatus && pbStatus.max_pairs) || 120;
+  const conc = (pbStatus && pbStatus.max_concurrency) || 3;
+  if (!pbModelsList().length) {
+    // 留空是推荐用法：由服务端按号分域，国内只探 cn 档、国际探 global 三档。
+    el.textContent = '模型留空 ⇒ 按域自动分流：' + pbDefaultSummary() +
+      ' · 将发起 ' + n + ' 次真实调用 · 结果写回选号器（账号级结论 12h 有效，到期自动回轮换）';
+    el.style.color = '';
+    return;
+  }
+  if (!n) { el.textContent = '当前范围下没有可测组合（检查 realm: 前缀与勾选的账号域是否匹配）'; return; }
+  const warn = n > max ? '⚠️ 超过单次上限 ' + max + '，会被拒绝' : '将发起 ' + n + ' 次真实调用';
+  el.textContent = warn + ' · 并发 ' + conc + ' · 预计约 ' + Math.ceil(n / conc * 1.5) +
+    ' 秒 · 真实调用会消耗上游额度（探针消耗网关不记账）';
+  el.style.color = n > max ? 'var(--bad)' : '';
+}
+function pbRow(r) {
+  const short = r.uid && r.uid.length > 16 ? r.uid.slice(0, 16) + '…' : (r.uid || '');
+  let tag;
+  if (r.ok) tag = '<span class="tag ok">可用</span>';
+  else if (r.code === '14018') tag = '<span class="tag bad">额度耗尽</span>';
+  else if (r.code === '14003') tag = '<span class="tag warn">模型限流</span>';
+  else if (r.code === '11102') tag = '<span class="tag mute">模型不存在</span>';
+  else if (r.status < 0) tag = '<span class="tag bad">连不上</span>';
+  else tag = '<span class="tag warn">HTTP ' + r.status + '</span>';
+  const cls = r.ok ? '' : (r.code === '14018' || r.status < 0 ? 'off' : 'cool');
+  // 写回列：只有真的动了池状态才有内容 —— "探测到了"与"已影响选号"是两件事。
+  const applied = r.applied
+    ? '<span style="color:var(--ink-2)">' + esc(r.applied) + '</span>'
+    : '<span class="hint">—</span>';
+  return '<tr class="' + cls + '" title="uid: ' + esc(r.uid || '') + '">' +
+    '<td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"><div class="nm">' + esc(short) + '</div></td>' +
+    '<td>' + (r.realm === 'global' ? '<span class="realm-tag">国际版</span>' : '国内版') + '</td>' +
+    '<td class="num">' + esc(r.model || '') + '</td>' +
+    '<td>' + tag + (r.note ? ' <span class="hint" style="font-size:11px">' + esc(r.note) + '</span>' : '') + '</td>' +
+    '<td style="font-size:11.5px">' + applied + '</td>' +
+    '<td class="num" style="color:var(--ink-3)">' + esc(r.code || '—') + '</td>' +
+    '<td class="num" style="color:var(--ink-3)">' + (r.ms != null ? r.ms + ' ms' : '—') + '</td>' +
+    '</tr>';
+}
+function pbRender(st) {
+  const rows = st.rows || [];
+  const sum = st.summary || {};
+  const el = $('pbNote');
+  if (st.running) {
+    el.textContent = '进行中 ' + st.done + ' / ' + st.total + ' · ' + dur((st.elapsed_ms || 0) / 1000);
+  } else if (st.total) {
+    el.textContent = '可用 ' + (sum.ok || 0) + ' · 额度耗尽 ' + (sum.hard_credit || 0) +
+      ' · 模型限流 ' + (sum.model_rate || 0) + ' · 其它 ' + (sum.other || 0) +
+      ' · 耗时 ' + dur((st.elapsed_ms || 0) / 1000) + (st.note ? ' · ' + st.note : '');
+  } else {
+    el.textContent = '';
+  }
+  $('btnProbeCancel').hidden = !st.running;
+  $('btnProbeRun').disabled = !!st.running;
+  $('btnProbeRun').textContent = st.running ? '探测中…' : '开始探测';
+  $('pbBody').innerHTML = rows.length
+    ? rows.map(pbRow).join('')
+    : '<tr><td colspan="8"><div class="empty"><div class="big">还没有探测结果</div>' +
+      '模型留空即可（按域自动分流）——点「开始探测」才会真实调用上游，网关不会自己跑</div></td></tr>';
+}
+function pbStopPoll() { if (pbTimer) { clearInterval(pbTimer); pbTimer = null; } }
+async function pbPoll() {
+  try {
+    const st = await api('probe/status');
+    pbStatus = st;
+    pbRender(st);
+    pbPlan();
+    if (!st.running) pbStopPoll();   // 跑完即停：不轮询、不自动重跑
+  } catch (e) { pbStopPoll(); }
+}
+// pbInit 只读一次 status（回填默认档说明 + 显示上次结果），**不启动任何探测**。
+async function pbInit() {
+  if (pbTimer) return;               // 正在轮询就别打扰
+  try {
+    const st = await api('probe/status');
+    pbStatus = st;
+    pbRender(st);
+    pbPlan();
+    if (st.running) pbStartPoll();   // 上次离开页面时还在跑 → 接回轮询
+  } catch (e) { /* 未鉴权等场景静默 */ }
+}
+function pbStartPoll() {
+  pbStopPoll();
+  pbTimer = setInterval(pbPoll, 800);
+  pbPoll();
+}
+$('btnProbeRun').onclick = async () => {
+  const models = pbModelsList();
+  if (!models.length) return toast('请至少填一个模型', 'err');
+  const uids = pbSelectedUids();
+  if (!uids.length) return toast('请至少勾一个账号', 'err');
+  const n = pbPairCount();
+  const max = (pbStatus && pbStatus.max_pairs) || 120;
+  if (n > max) return toast('组合数 ' + n + ' 超过单次上限 ' + max + '，请缩小范围', 'err');
+  const b = $('btnProbeRun');
+  b.disabled = true; b.textContent = '启动中…';
+  try {
+    await api('probe/start', { method: 'POST', body: JSON.stringify({ models: models, uids: uids }) });
+    $('pbBody').innerHTML = '';
+    pbStartPoll();
+    toast('探针已启动（真实调用上游，请稍候）', 'ok');
+  } catch (e) {
+    toast('启动失败：' + e.message, 'err');
+    b.disabled = false; b.textContent = '开始探测';
+  }
+};
+$('btnProbeCancel').onclick = async () => {
+  try { await api('probe/cancel', { method: 'POST' }); toast('已请求停止（已完成的结果保留）', 'ok'); }
+  catch (e) { toast('停止失败：' + e.message, 'err'); }
+  pbPoll();
+};
+$('pbModels').addEventListener('input', pbPlan);
+
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
@@ -587,6 +959,7 @@ $('btnRefresh').onclick = async () => {
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
+  else if (view === 'quota') loadQuota(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') pollQueueOnce();
 }

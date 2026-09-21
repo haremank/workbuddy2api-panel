@@ -2,6 +2,7 @@
 package pool
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,14 @@ type CoolKind int
 const (
 	CoolHard CoolKind = iota // 余额不足 → 冷却到次日 04:00（等签到恢复）
 	CoolSoft                 // 429 → 短冷却
+	// CoolProbe 手动探针的实测结论（用户 2026-09-21：「探测记录值保存 12 小时，
+	// 之后默认恢复可以被切换器选择」）。与 CoolHard 的区别只有两点：
+	//   - 时长固定 12h（ProbeVerdictTTL），不跟签到墙钟；到期 until 自然过期
+	//     ⇒ 账号**自动**回到默认候选集，无需任何显式复位。
+	//   - 恢复路径更多：实测 200 / 余额刷新回正 / 人工解冻都会提前清掉它。
+	// 选号侧与 CoolHard 同档（normal 与全冷却兜底都不参与）——依据同为"调了必 14018"，
+	// 差异只在有效期口径。持久化沿用 cool_kind 整数（旧文件 0/1 不受影响）。
+	CoolProbe
 )
 
 func (k CoolKind) String() string {
@@ -26,6 +35,8 @@ func (k CoolKind) String() string {
 		return "hard_credit"
 	case CoolSoft:
 		return "soft_rate"
+	case CoolProbe:
+		return "probe_verdict"
 	}
 	return "unknown"
 }
@@ -61,19 +72,36 @@ type TokenUsageDelta struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID           string    `json:"uid"`
-	Nickname      string    `json:"nickname,omitempty"`
-	Credits       int64     `json:"credits"`
-	CreditsTotal  int64     `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
-	Cooling       bool      `json:"cooling"`
-	CoolKind      string    `json:"cool_kind,omitempty"`
-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
-	Until         time.Time `json:"until,omitempty"`
-	Reason        string    `json:"reason,omitempty"`
-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	UID          string `json:"uid"`
+	Nickname     string `json:"nickname,omitempty"`
+	Credits      int64  `json:"credits"`
+	CreditsTotal int64  `json:"credits_total,omitempty"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	// CreditsKnown 余额是否已由一次成功的余额查询确认。
+	// 让消费方区分 credits==0 的两种含义：true = 确实耗尽（选号已出池）、
+	// false = 未知（新号 / 余额查询从未成功，仍参与选号）。面板额度水位视图据此分色。
+	CreditsKnown bool `json:"credits_known,omitempty"`
+	// Servable 该账号此刻是否会被选号器接受（= entry.healthy：未禁用、未冷却/熔断/
+	// 连败降权，且余额未耗尽）。**不含**在途名额（max_in_flight）与 costTier 硬过滤
+	// ——那两项是 pick() 的二次筛选，需请求上下文。面板额度水位视图据此区分
+	// 「账面上有余额」与「此刻真选得中」。
+	Servable bool `json:"servable"`
+	// CreditsUpdated 余额读数的更新时刻（entry.creditsUpdated）。零值 = 从未成功查询。
+	// 面板额度水位视图据此显示读数鲜度：后台余额任务每 balance_refresh_minutes 刷新，
+	// 读数过旧即说明该号的额度数据不可信（余额查询持续失败）。
+	CreditsUpdated time.Time `json:"credits_updated,omitempty"`
+	Cooling        bool      `json:"cooling"`
+	CoolKind       string    `json:"cool_kind,omitempty"`
+	CoolRemaining  int64     `json:"cool_remaining_sec,omitempty"`
+	Until          time.Time `json:"until,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	SoftStreak     int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
-	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
-	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
+	// 数据源 = entry.modelCooldowns 中**未到期**的条目，按模型名排序（输出稳定）；
+	// 写入方有三类，不限于 6004：
+	//   - 6004 **带**重置文案 → CooldownSoftForModel（对齐上游墙钟）；
+	//   - 14003（global，实测恒无文案）→ CooldownModelRateLimit（有界退避）；
+	//   - 11102 模型不存在 → BlockModelBackoff。
+	// 到期即消失（惰性清理，零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
@@ -165,16 +193,29 @@ type entry struct {
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废。
 	// 运行态，签到/余额刷新时更新，不单独持久化（credits 仍持总量）。
 	creditsExpiring int64
-	successCount    int64      // 累计成功
-	errTotal        int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr         time.Time  // 最近一次错误时间
-	lastSuccess     time.Time  // 最近一次成功时间
-	tokenUsage      TokenUsage // 聊天请求 token 用量摘要（持久化）
-	coolKind        CoolKind
-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
-	disabled        bool
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// creditsKnown 余额是否已被一次**成功的**余额查询确认（SetCredits /
+	// SetCreditsDetailed / ReenableIfCredits 置 true；持久化恢复时按
+	// CreditsTotal > 0 推断）。
+	//
+	// 为什么需要它：credits 的零值 0 有歧义——既可能是"确实为 0（已耗尽）"，
+	// 也可能是"从没查到过（新号 / 余额查询长期失败）"。选号侧的余额判据
+	// （healthy 里"已知且 <=0 ⇒ 不可选"）必须只对前者生效，否则余额查询故障
+	// 会把整池账号误判为耗尽而永久出池。
+	creditsKnown bool
+	// creditsUpdated 余额最近一次被**成功查询**更新的时刻（"实时额度监控"的鲜度来源）。
+	// 后台余额刷新任务每 schedule.balance_refresh_minutes 跑一次；面板额度水位视图
+	// 据此显示"这个读数有多新"，避免把过期数字当实时值看。零值 = 从未成功查询过。
+	creditsUpdated time.Time
+	successCount   int64      // 累计成功
+	errTotal       int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr        time.Time  // 最近一次错误时间
+	lastSuccess    time.Time  // 最近一次成功时间
+	tokenUsage     TokenUsage // 聊天请求 token 用量摘要（持久化）
+	coolKind       CoolKind
+	until          time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+	disabled       bool
+	reason         string
+	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -240,11 +281,23 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 	return mc, true
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
+// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期、
+// 且余额未耗尽）。
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
+		return false
+	}
+	// 余额耗尽 ⇒ 不可选。上游对 0 余额账号一律返回 429 + code 14018
+	// （Credits exhausted），**连限免模型也不放行**（2026-09-21 实测：global 池
+	// 两个 credits=0 的号反复被选中并失败）。这类号必须彻底退出轮换，否则
+	// 每次选中都白打一轮上游、并把会话粘性从健康号上顶掉。
+	//
+	// 只看 creditsKnown 为真的账号：余额查询从未成功过时 credits 的 0 是"未知"
+	// 而非"耗尽"，不能据此出池。余额恢复后由 ReenableIfCredits 自动清冷却回池
+	// （remain > 0 时 revive），无需人工干预。
+	if e.creditsKnown && e.credits <= 0 {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -280,6 +333,70 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 		return false
 	}
 	return !mc.Until.IsZero() && now.Before(mc.Until)
+}
+
+// modelBlockReasonPrefix 11102 负缓存的 reason 前缀。与 upstream.ModelBlockReason
+// （"11102 model not available"）同源；pool 不 import upstream（保持依赖方向），
+// 按本包既有约定复述前缀（见 cooldown.go 的 BlockModelClear 判定）。
+const modelBlockReasonPrefix = "11102"
+
+// modelBackoffCooled 报告 (账号, 模型) 是否处于 **11102 负缓存**（上游明确答复「该后端无此模型」）。
+//
+// 与 modelCooled 的区别：modelCooled 对所有模型级冷却（6004 / 14003 / 11102）一视同仁，
+// 用于「正常选号」——一律避开；本方法只认 11102，用于「全冷却兜底」——
+// 兜底是半开试探，**放过限流（6004/14003，分钟级、可能已恢复），但不放过"不存在"**
+// （上游已确定性答复，试探只会白打一轮并把负缓存的指数退避重新推高）。
+func (e *entry) modelBackoffCooled(now time.Time, reqModel string) bool {
+	if reqModel == "" {
+		return false
+	}
+	mc, ok := e.modelCooldowns[reqModel]
+	if !ok || mc.Until.IsZero() || !now.Before(mc.Until) {
+		return false
+	}
+	return strings.HasPrefix(mc.Reason, modelBlockReasonPrefix)
+}
+
+// expiryForModel 返回账号**对指定模型**的最近可恢复时刻：账号级 expiry 与模型级冷却截止取更早者。
+// reqModel 为空、或该模型无冷却记录时，等价 expiry(now)。
+//
+// 为什么必须有它（round9 独立审核发现的线上缺陷）：expiry() 只覆盖账号级三维
+// （until / breakerUntil / degradeUntil），**不含 modelCooldowns** ⇒ 一个账号级完全健康、
+// 只是"该模型被限流"的号，expiry() 返回零值 ⇒ 被全冷却兜底当作"不在冷却期"跳过。
+// 当某模型的冷却覆盖了该 realm 的全部账号时，兜底返回 nil ⇒ 客户端拿到即时 503、
+// **一次上游尝试都不发**，而该模型仍列在 /v1/models 里（实测：global:hy4-* 连续即时 503，
+// 同一时刻 global:deep-model 正常 200 ⇒ 排除纯粹来自模型级冷却）。
+func (e *entry) expiryForModel(now time.Time, reqModel string) time.Time {
+	t := e.expiry(now)
+	if reqModel == "" {
+		return t
+	}
+	mc, ok := e.modelCooldowns[reqModel]
+	if !ok || mc.Until.IsZero() || !now.Before(mc.Until) {
+		return t
+	}
+	if t.IsZero() || mc.Until.Before(t) {
+		t = mc.Until
+	}
+	return t
+}
+
+// fallbackKindForModel 报告兜底账号属于哪一类冷却；**模型级冷却单独标为 "model"**，
+// 让"因为该模型被限流而兜底"在日志里一眼可见（round9 那次故障只能靠状态码反推）。
+func (e *entry) fallbackKindForModel(now time.Time, reqModel string) string {
+	k := e.fallbackKind(now)
+	if reqModel == "" {
+		return k
+	}
+	mc, ok := e.modelCooldowns[reqModel]
+	if !ok || mc.Until.IsZero() || !now.Before(mc.Until) {
+		return k
+	}
+	// 模型级截止更早（或账号级无冷却）⇒ 本次兜底的实际原因是模型级冷却。
+	if acc := e.expiry(now); acc.IsZero() || mc.Until.Before(acc) {
+		return "model"
+	}
+	return k
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
@@ -319,7 +436,7 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 
 // expiry 返回账号当前仍在生效的最近冷却/熔断/降权截止时间（三个截止取最早者）；不在冷却期返回零值。
 // 供全冷却兜底选取"最早到期"账号用。连败降权计入兜底口径：降权号参与兜底（其失败
-// 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard 才被排除）。
+// 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard/CoolProbe 才被排除）。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -353,13 +470,19 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	CreditsTotal int64     `json:"credits_total,omitempty"`
-	Disabled     bool      `json:"disabled"`
-	Reason       string    `json:"reason,omitempty"`
-	Until        time.Time `json:"until,omitempty"`
-	CoolKind     CoolKind  `json:"cool_kind"`
-	SuccessCount int64     `json:"success_count,omitempty"`
+	Credits      int64 `json:"credits"`
+	CreditsTotal int64 `json:"credits_total,omitempty"`
+	// CreditsKnown 余额是否已由成功查询确认（entry.creditsKnown）。
+	// 持久化以保留「0 额度号已出池」这一判定，避免重启后它又混回轮换。
+	// 旧 state 文件无此字段 → false，恢复时按 CreditsTotal > 0 兜底推断（向后兼容）。
+	CreditsKnown bool `json:"credits_known,omitempty"`
+	// CreditsUpdated 余额读数更新时刻（面板额度水位视图的鲜度来源）。
+	CreditsUpdated time.Time `json:"credits_updated,omitempty"`
+	Disabled       bool      `json:"disabled"`
+	Reason         string    `json:"reason,omitempty"`
+	Until          time.Time `json:"until,omitempty"`
+	CoolKind       CoolKind  `json:"cool_kind"`
+	SuccessCount   int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64      `json:"err_total,omitempty"`

@@ -233,6 +233,20 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
+/* 导入 JSON：粘贴区沿用输入框视觉，等宽字体便于核对凭证文本。 */
+textarea {
+  width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface-2); color: var(--ink); font: 13px/1.5 var(--sans);
+}
+textarea:focus { outline: none; border-color: var(--accent); }
+textarea.mono { font-family: var(--mono); font-size: 12px; }
+.file-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.file-row input[type=file] { font-size: 12.5px; color: var(--ink-2); max-width: 100%; }
+.imp-list { margin-top: 12px; max-height: 240px; overflow: auto; }
+.imp-list table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.imp-list th { text-align: left; color: var(--ink-3); font-weight: 500; padding: 5px 8px; border-bottom: 1px solid var(--line-soft); }
+.imp-list td { padding: 5px 8px; border-bottom: 1px solid var(--line-soft); color: var(--ink-2); }
+.imp-list .st-added { color: var(--ok); } .imp-list .st-updated { color: var(--warn); } .imp-list .st-error { color: var(--bad); }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .usage-cell { min-width: 268px; }
 .usage-line {
@@ -420,6 +434,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
+      <li><a href="#quota" data-view="quota">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8c2.6 3 4.2 5 4.2 7.2A4.2 4.2 0 0 1 3.8 9C3.8 6.8 5.4 4.8 8 1.8z"/><path d="M8 12.4V8.6"/></svg>
+        额度水位</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -452,6 +469,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
       <button id="btnRefresh">刷新</button>
+      <button id="btnImport">导入 JSON</button>
       <button class="primary" id="btnAdd">添加账号</button>
     </div>
 
@@ -462,7 +480,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k" title="全部套餐剩余之和（含免费额度 / Free Plan），非「已购积分」">可用额度 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
@@ -484,6 +502,72 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 额度水位 -->
+    <section class="view" id="view-quota" hidden>
+      <div class="stats" id="qStats"></div>
+
+      <div class="box">
+        <header>
+          <h3>额度水位</h3>
+          <span class="hint">可用额度升序 · 额度 = 全部套餐剩余之和（含免费额度 / Free Plan），非「已购积分」 · 0 额度号已被选号器摘出轮换，充值或免费额度回满后自动回池</span>
+          <span class="grow"></span>
+          <span class="note" id="qNote"></span>
+          <button class="xs" id="btnQuotaRefresh">立即刷新余额</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>账号</th><th>域</th><th title="全部套餐剩余之和（含免费额度 / Free Plan），非「已购积分」">可用额度</th><th>状态</th>
+            <th>读数时间</th><th>冷却 / 限额</th>
+          </tr></thead>
+          <tbody id="qBody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- 手动探针：点了才跑的真实可用性探测。
+           边界（不要改）：绝不自动运行（无定时器/无预热）；真实调用会消耗上游额度，
+           所以并发与总量都压住（见 probe.go 常量）。
+           结果**会写回池状态**（2026-09-21 用户要求「探针结果要计入账号自动切换器」）：
+           200 解模型避让 + 撤探针结论 / 14003 模型级冷却（账号不连坐）/
+           14018 账号级出池且**12h 后自动回到轮换**（CoolProbe，到期即恢复，无需人工）。
+           自动换号仍由真实请求的既有路径负责，探针只是把实测结论喂给它。 -->
+      <div class="box">
+        <header>
+          <h3>手动探针 <span class="hint">点了才跑 · 真实调用上游 · 结果写回选号器（账号级结论 12h 有效）· 不会自动运行</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="pbNote"></span>
+          <button class="xs" id="btnProbeCancel" hidden>停止</button>
+          <button class="xs primary" id="btnProbeRun">开始探测</button>
+        </header>
+        <div class="pad">
+          <div class="file-row">
+            <span class="hint" style="font-size:12px;min-width:64px">模型</span>
+            <textarea id="pbModels" class="mono" rows="6" spellcheck="false"
+              placeholder="每行一个模型名，支持 realm:model 前缀（如 global:hy4-preview-f）。留空 = 按域自动分流：国内版只探 cn:deepseek-v4.1-flash，国际版探 deepseek-v4.1-flash + hy4-preview-f（都是 0x 免费档，探测不花额度）"></textarea>
+          </div>
+          <div class="file-row" style="align-items:flex-start">
+            <span class="hint" style="font-size:12px;min-width:64px;padding-top:3px">账号范围</span>
+            <div id="pbAccts" style="flex:1;display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px"></div>
+          </div>
+          <div class="file-row" style="margin-bottom:0">
+            <span class="hint" style="font-size:12px;min-width:64px"></span>
+            <span class="hint" id="pbPlan" style="font-size:12px"></span>
+          </div>
+        </div>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>账号</th><th>域</th><th>模型</th><th>结果</th><th>写回选号器</th><th>上游 code</th><th>耗时</th>
+          </tr></thead>
+          <tbody id="pbBody"></tbody>
         </table>
         </div>
       </div>
@@ -538,6 +622,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>模型能力 <span class="hint">官方返回的最大输出仅为参考——实测多数模型实际被限制在 40K 左右（如 deepseek-v4.1-flash 仅 32K），配置 max_tokens 时请自行留意，以免长输出被静默截断</span></h3>
           <span class="grow"></span>
           <span class="note" id="mdNote">实时查询上游</span>
+          <select id="mdRealm" title="切换 realm：CN 用国内账号拉目录，global 用国际版账号拉目录" style="width:auto;padding:3.5px 8px;font-size:12.5px;border-radius:6px">
+            <option value="cn">CN · 国内版</option>
+            <option value="global">global · 国际版</option>
+          </select>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
         <div class="tbl-wrap">
@@ -892,6 +980,31 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 导入账号 JSON -->
+<div class="veil" id="impVeil">
+  <div class="dlg" style="width:720px">
+    <header>
+      <h3>导入账号 JSON</h3>
+      <div class="hint">批量导入凭证文件（切换器导出形 / auths 原生形均可，数组或 {"accounts":[...]} 包裹都支持）。同 uid 已存在则覆盖凭证并热加载，无需重启。</div>
+    </header>
+    <div class="body">
+      <div class="file-row">
+        <input type="file" id="impFile" accept=".json,application/json">
+        <span class="hint" style="font-size:12px">选择文件后自动填入下方</span>
+      </div>
+      <textarea id="impText" class="mono" rows="9" placeholder='[{"uid":"...","nickname":"...","access_token":"...","refresh_token":"..."}]'></textarea>
+      <div class="state" id="impState" hidden></div>
+      <div class="imp-list" id="impList" hidden></div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnImpPreview">预览（不写入）</button>
+      <button id="btnImpRun" class="primary">导入</button>
+      <button id="btnImpClose">关闭</button>
     </footer>
   </div>
 </div>

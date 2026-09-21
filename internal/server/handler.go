@@ -62,6 +62,12 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
+	// ModelsCN / ModelsGlobal 模型名单的运维补充/屏蔽表（config.models，零值=不改动）。
+	// 用于抹平"上游目录 ≠ 实际可调"：CN 侧补上能调通但未被列出的模型，
+	// global 侧剔除列了却恒 11102 的死条目。纯补充，不替代动态探测。
+	ModelsCN     upstream.ModelOverrides
+	ModelsGlobal upstream.ModelOverrides
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -328,7 +334,9 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
-	for _, mi := range h.fetchDynamicModels() {
+	// 运维补充/屏蔽表（config.models，零值=不改动）：先按 Hide 过滤动态结果，
+	// 再按 Extra 追加"上游能调通但目录未列出"的模型。
+	for _, mi := range h.applyCNModelOverrides(h.fetchDynamicModels()) {
 		entry := map[string]any{
 			"id":       "cn:" + mi.ID,
 			"object":   "model",
@@ -363,6 +371,7 @@ func (h *Handler) modelList() []map[string]any {
 		// global 域 effort 能力三级查找：探测下发桶（权威）→ 静态兜底表 → 省略。
 		// 先 fetchGlobalModels（内部探测并落 effort 桶），再按 id 取快照。
 		globalIDs, globalAccount := h.fetchGlobalModels()
+		globalIDs = h.cfg.ModelsGlobal.Apply(globalIDs)
 		// 探测对象形态的全字段条目（与 fetchGlobalModels 共享同一次探测缓存）：
 		// 命中 id 才透出富字段；窄表/失败 → nil，按裸 ID 条目输出（不编造字段）。
 		// globalAccount 为 nil（无 global 号）时返回 nil，跳过富字段映射。
@@ -379,8 +388,15 @@ func (h *Handler) modelList() []map[string]any {
 				"owned_by": "workbuddy",
 			}
 			// context_length / max_output_tokens 四级查找（与 CN 动态分支同口径）。
+			// 补充项（extra_global）在上游 global 目录里没有条目，走 catalogOrSeed
+			// 三级回填：本 realm 全量 catalog → CN 同名条目回落 → 静态种子表。
+			// 三级仍 miss ⇒ 裸 ID 条目（不编造字段）。
+			mi, hasInfo := globalInfos[id]
+			if !hasInfo {
+				mi, hasInfo = h.catalogOrSeed("global", id)
+			}
 			var remoteCtx, remoteOut int64
-			if mi, ok := globalInfos[id]; ok {
+			if hasInfo {
 				entry = applyModelInfoFields(entry, mi)
 				remoteCtx, remoteOut = mi.ContextWindow, mi.MaxTokens
 			}
@@ -398,6 +414,57 @@ func (h *Handler) modelList() []map[string]any {
 		}
 	}
 	return out
+}
+
+// applyCNModelOverrides 把 config.models 的 CN 表套用到动态探测结果上。
+//
+// 必须返回**新切片**：fetchDynamicModels 在缓存命中时直接返回 dynamicModelsCache.ids
+// （1h 缓存的底层数组），就地改写会污染缓存、把补充项"腌"进后续 1h 的响应里。
+//
+// 补充项的元数据回填（2026-09-21 独立审核后加）：这些模型上游能调通、但被
+// agents[cli] 白名单挡在动态目录之外，所以 FetchModels 的返回值里没有它们。
+// 上游企业端点的 data.models 全量目录里**有**（30 条 vs 白名单 16 条），
+// 已在同一次探测时落进 upstream 的 catalog 桶，这里按 id 查回权威字段
+// （name/description/credits/maxInputTokens 等）。查不到再走静态种子表
+// （upstream.ExtraModelSeed），仍 miss 才退化为裸 ID。
+//
+// 为什么要紧：裸 ID 的 context_length 会落到四级查找的 1M 兜底值，
+// 而 deepseek-v3-2-volc 上游其实只有 96K —— 客户端按 1M 估算会发超长 prompt。
+func (h *Handler) applyCNModelOverrides(infos []upstream.ModelInfo) []upstream.ModelInfo {
+	if h.cfg.ModelsCN.IsZero() {
+		return infos
+	}
+	ids := make([]string, 0, len(infos))
+	byID := make(map[string]upstream.ModelInfo, len(infos))
+	for _, mi := range infos {
+		ids = append(ids, mi.ID)
+		byID[mi.ID] = mi
+	}
+	res := make([]upstream.ModelInfo, 0, len(ids)+len(h.cfg.ModelsCN.Extra))
+	for _, id := range h.cfg.ModelsCN.Apply(ids) {
+		if mi, ok := byID[id]; ok {
+			res = append(res, mi)
+			continue
+		}
+		res = append(res, h.fillFromCatalog("cn", id))
+	}
+	return res
+}
+
+// catalogOrSeed 补充项元数据三级查找的**薄封装**——真正实现在
+// upstream.Client.CatalogOrSeed（全仓唯一入口，panel 侧共用同一份，防语义漂移）。
+// 保留本方法只为让调用点读起来与「本 realm 优先」的语义贴近。
+func (h *Handler) catalogOrSeed(realm, id string) (upstream.ModelInfo, bool) {
+	return h.cfg.Upstream.CatalogOrSeed(realm, id)
+}
+
+// fillFromCatalog 给"补充项"回填上游元数据（本 realm 全量目录 → CN 回落 → 静态种子），
+// 三级全 miss → 裸 ID 条目（不编造字段）。
+func (h *Handler) fillFromCatalog(realm, id string) upstream.ModelInfo {
+	if mi, ok := h.catalogOrSeed(realm, id); ok {
+		return mi
+	}
+	return upstream.ModelInfo{ID: id}
 }
 
 // fetchGlobalModels 返回 global 模型名单（纯动态探测结果）及被探测账号。
@@ -431,7 +498,16 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	// realm 分池（2026-09-21 修，WB2API-REALM-FIX）：CN 目录必须用 CN 号拉。
+	// 历史实现用无过滤的 Pick()（= pick(nil,"","")，realm 传空 = 不过滤），池里
+	// global 号占多数时会抽到 global 号 → chatBase 切到 workbuddy.ai → 把 global
+	// /v3/config 的 8 个聊天别名（o4-mini/fast-model/balanced-model/primary-model/
+	// deep-model/auto-chat/enhance-1.0/default-model）当成 CN 目录输出，而 CN 真实
+	// 的 ~30 个模型（deepseek-v4.1-flash/deepseek-v4-pro/glm-5.x/kimi-k2.x/minimax-m3/
+	// hunyuan-*）一个都不出现。实测：cn:o4-mini、cn:auto-chat、cn:enhance-1.0、
+	// cn:default-model、cn:primary-model 上游均 11102（模型不存在）。
+	// 与下方函数注释"只从 CN realm 账号拉取（global 走独立探测）"对齐。
+	acct := h.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
 	if acct == nil {
 		return nil
 	}
@@ -929,9 +1005,12 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //
 // 九条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
-//     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
+//   - ErrSoftRate → **先判模型级限流**（code 6004 / 14003）：带上游重置墙钟时
+//     只冻该模型并对齐墙钟（CooldownSoftForModel）；14003（global，实测恒无时刻）
+//     走模型级有界退避（CooldownModelRateLimit）——两者都不冻整号。6004 无文案时
+//     保持旧语义落账号级（既有测试锁定）。其余账号级：带重置墙钟则对齐之
+//     （CooldownSoftRate），否则有界退避。冷却时长优先采信 Retry-After 头
+//     （uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却：**不 Disable**——WAF 403 是 IP/指纹维频控信号，
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
@@ -958,15 +1037,27 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 不需要异步核查（冗余）。立即换号。
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSoftRate:
-		// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
-		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
-		if resetAt, ok := upstream.ParseRateReset(body); ok {
-			if upstream.IsModelRateLimit(body) {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
+		// 模型级限流**先判**，且不受「有无重置文案」限制。旧实现把该判定嵌在
+		// ParseRateReset 成功分支内 ⇒ 无文案的 14003 永远落不到模型级，被当账号级
+		// 冻结整号 soft_rate（默认 60s），而同号其它模型实测仍健康（同时刻 200）。
+		//   - 带上游重置墙钟（6004「将在 … 重置」）→ CooldownSoftForModel 对齐墙钟。
+		//   - 14003 实测恒无恢复时刻 → CooldownModelRateLimit 模型级有界退避。
+		//   - 6004 无文案 → **保持旧语义**（落账号级有界退避），
+		//     TestChat6004WithoutResetFallsBackToBackoff 锁定，不在本次改动范围内。
+		// model 为空时不进模型级分支（没有可豁免的模型名），回落账号级原语义。
+		if code := upstream.ModelRateLimitCode(body); code != "" && model != "" {
+			if resetAt, ok := upstream.ParseRateReset(body); ok {
+				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, code+" model rate limit")
 				return
 			}
+			if code == upstream.ModelUsageLimitCode {
+				h.cfg.Pool.CooldownModelRateLimit(uid, h.softCooldown(), model, code+" model rate limit")
+				return
+			}
+		}
+		// 账号级：统一对齐上游重置时间——只要 body 带「将在 … 重置」，无论业务 code 是
+		// 11140 rate-limiting 等何种形态，都精确冷却到该墙钟、绝不指数堆加。
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
 			return
 		}

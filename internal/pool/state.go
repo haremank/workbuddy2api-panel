@@ -105,10 +105,16 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain, total)
+			p.reviveCoolingLocked(e, remain, total) // 内部置 creditsKnown
 		} else {
 			e.credits = remain
 			e.creditsTotal = total
+			// remain == 0（或已禁用）也走这里：查询成功过，故余额是权威的 0
+			// ⇒ 置 creditsKnown 让选号侧把它当作"已耗尽"出池（healthy 的余额判据）。
+			// 这正是"余额刷新发现耗尽后把号摘出轮换"的落点——修复前只赋值不冷却，
+			// 0 额度号会一直留在池里被反复选中。
+			e.creditsKnown = true
+			e.creditsUpdated = time.Now()
 		}
 		p.dirty.Store(true)
 	}
@@ -469,6 +475,9 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
 		CreditsTotal:      e.creditsTotal,
+		CreditsKnown:      e.creditsKnown,
+		Servable:          e.healthy(now),
+		CreditsUpdated:    e.creditsUpdated,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,

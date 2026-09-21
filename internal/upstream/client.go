@@ -190,30 +190,107 @@ var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 // SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 
-// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
-// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
-// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
-const modelRateLimitCode = "6004"
+// 模型级 429 限流的业务 code。上游用它表达"该模型的使用量超限"，而不是账号整体
+// 被限流——账号健康，只是这个模型此刻被限（issue #31）。
+//
+//   - modelRateLimitCode 6004：CN realm 形态，msg 带中文「将在 … 重置」。
+//
+//   - modelUsageLimitCode 14003：global realm 形态，msg 仅 "too many requests"，
+//     **不给重置时刻**。2026-09-21 实测（同号、同时刻、逐模型直连上游）：
+//
+//     cfcc264d: hy4-preview-f ✅200 | hy4-preview 429/14003 | hy3 ✅200 | dsv4.1-flash ✅200
+//     f956ea9f: hy4-preview-f 429/14003 | hy4-preview ✅200 | hy3 ✅200 | dsv4.1-flash ✅200
+//
+//     ⇒ 14003 是**模型级**的（hy4 两档各自独立、不共享池），且与账号余额无关
+//     （有余额的号照样 14003）。若按账号级处理，整号会被冻结 soft_rate（默认 60s），
+//     而同号其它模型其实仍健康——这正是「接入国际版模型老是没反应」的第二个根因
+//     （第一个是 0 额度号被选中，round4 已修）。
+const (
+	modelRateLimitCode  = "6004"
+	modelUsageLimitCode = "14003"
+)
 
-// softRateResetPattern 匹配「将在 … 重置」，捕获中间的时间串。
+// ModelUsageLimitCode 是 14003 的对外只读别名。调用方据此区分两种模型级限流：
+//   - 6004：**带**重置文案时按模型级（对齐墙钟）；**无**文案时保持既有账号级有界退避
+//     （TestChat6004WithoutResetFallsBackToBackoff 锁定该现状）。
+//   - 14003：实测**恒无**重置文案，无论有无文案都按模型级处理（有界退避），
+//     否则整号被冻结 soft_rate 而同号其它模型仍健康。
+const ModelUsageLimitCode = modelUsageLimitCode
+
+// softRateResetPattern 匹配中文「将在 … 重置」，捕获中间的时间串。
 const softRateResetPattern = `将在 (.+?) 重置`
+
+// softRateResetPatternEN 匹配英文「… will reset at <时间>」，捕获时间串。
+//
+// 为什么需要：上游对 global realm（www.workbuddy.ai）返回**英文**限流文案，中文
+// 正则必然失配（2026-09-21 用户实测报文）：
+//
+//	429 usage exceeds frequency limit, but don't worry, your usage will reset at
+//	2026-09-22 12:48:43 UTC+8, alternatively, you can switch to the other models
+//	to continue using it.
+//
+// 失配的后果不是"报错"而是"静默降级"：ParseRateReset 返回 false → applyErrorPolicy
+// 退回**有界退避**（soft_rate 600s 起、翻倍、封顶 2h），完全忽略上游明说的恢复
+// 时刻 ⇒ 国际版模型在恢复前被反复重试（表现为"老是没反应"）。
+//
+// 时间戳严格限定为与 softRateTimeLayout 同构的形态（可选 UTC±N 后缀），不用
+// `(.+?)` 泛捕获——避免把 "at your request" 之类文本吞进来当时间解析。
+const softRateResetPatternEN = `(?i)reset(?:s)?\s+at\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\s*UTC[+-][0-9]{1,2})?)`
 
 // 限流判定正则预编译为包级 var：IsModelRateLimit / ParseRateReset 在每次错误
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
-	reSoftRateReset  = regexp.MustCompile(softRateResetPattern)
+	// 尾断言 (?:[^0-9]|$) 与 reBillingExhausted 同口径：RE2 无 lookahead，只能靠
+	// 数字边界挡住 `"code":60040` / `"code":140030` 这类更长 code 被前缀误命中。
+	// 捕获组 = 命中的 code，供 ModelRateLimitCode 生成可读原因。
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?(` + modelRateLimitCode + `|` + modelUsageLimitCode + `)(?:[^0-9]|$)`)
+	reSoftRateReset   = regexp.MustCompile(softRateResetPattern)
+	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
 
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004 / 14003）。
 // 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
 func IsModelRateLimit(body string) bool {
 	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
 	return reModelRateLimit.MatchString(body)
+}
+
+// ModelRateLimitCode 返回 body 命中的模型级限流业务 code（"6004" / "14003"），
+// 未命中返回空串。供 applyErrorPolicy 生成可读的冷却原因，台账/日志里能一眼区分
+// 是哪种模型级限流（6004 带重置墙钟、14003 只有有界退避）。
+func ModelRateLimitCode(body string) string {
+	if m := reModelRateLimit.FindStringSubmatch(body); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// billingExhaustedCode 明确指向「计费余额耗尽」的业务 code。
+//
+// 上游把余额耗尽以 **HTTP 429** 承载（2026-09-21 实测 body：
+// `{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link
+// below to purchase add-on packs..."}}}`）。而 Classify 的 `status == 429` 兜底
+// 分支排在 hardMarkers 之前 ⇒ 该响应被判为 ErrSoftRate（限流）→ 只软冷却一个
+// soft_rate（默认 600s）便回池，余额耗尽的账号被**反复选中且每次必失败**。
+//
+// 故把「429 + 本 code」提升到 429 兜底之前判定为 ErrHardCredit。**只认精确业务
+// code**，不认 "quota exceeded"/"额度不足" 这类跨计费/限流两界的模糊措辞——
+// 那正是 429 先判所要保护的情形（见 Classify 第 5 层）。
+const billingExhaustedCode = "14018"
+
+// 尾部 (?:[^0-9]|$) 是**必须**的数字边界断言：RE2（Go regexp）不支持 lookahead，
+// 若只写 `14018` 则 `"code":140180` 这类更长的 code 会被误命中——而误命中会把
+// 限流号错判成余额耗尽、硬冷却到次日 04:00（代价远大于漏判），故必须挡住。
+var reBillingExhausted = regexp.MustCompile(`"code"\s*:\s*"?` + billingExhaustedCode + `(?:[^0-9]|$)`)
+
+// IsBillingExhausted 报告 body 是否明确指向计费余额耗尽（业务 code 14018）。
+// 与 IsModelRateLimit 同口径：只比业务 code 字段，容忍 JSON 空格与字符串形式。
+func IsBillingExhausted(body string) bool {
+	return reBillingExhausted.MatchString(body)
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
@@ -368,16 +445,28 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 // ParseRateReset 从任何限流响应 body 里统一解析「将在 … 重置」时间（上游 UTC+8 文案）。
 // 成功返回解析出的**墙钟时刻**（按 UTC+8 解释），失败返回零值 + false。
 //
+// 中英文两种文案都认：中文 `将在 <ts> 重置`（cn realm）与英文
+// `<ts> UTC+8` 形式的 `... will reset at <ts>`（global realm，见 softRateResetPatternEN）。
+// 英文文案此前不被识别，导致 global 侧限流**静默退回有界退避**、忽略上游明说的
+// 恢复时刻（2026-09-21 修复）。
+//
 // 是否走模型级豁免、时日对齐到 until 还是 modelCooldowns，由冷却决策侧（pool）按
 // IsModelRateLimit 判定，本函数只负责「把上游明说的恢复时刻抽出来」。没有时间文案
 // 的限流也照常由调用方退回有界退避（绝不臆造时间）。
 func ParseRateReset(body string) (time.Time, bool) {
 	m := reSoftRateReset.FindStringSubmatch(body)
 	if len(m) < 2 {
+		m = reSoftRateResetEN.FindStringSubmatch(body)
+	}
+	if len(m) < 2 {
 		return time.Time{}, false
 	}
 	ts := strings.TrimSpace(m[1])
-	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
+	// 顺序敏感：必须先剥 UTC+8 后缀、再归一 RFC3339 的 "T" 分隔。
+	// "UTC+8" 自身含大写 T，若先做 Replace("T", " ") 会把后缀破坏成 "U C+8"，
+	// 使 TrimSuffix 失配 → 整条时间解析失败（静默退回有界退避）。
+	ts = strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(ts, " UTC+8"), "UTC+8"))
+	ts = strings.Replace(ts, "T", " ", 1)
 	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
 	if err != nil {
 		return time.Time{}, false
@@ -401,21 +490,27 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     限流可指数退避等自愈，账号级故障等不来）。11140 的 model 级限流变体
 //     （rate-limiting 文案）因 marker 不含该文案而天然落到 softRateMarkers 层，
 //     不受影响。
-//  4. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
+//  4. 429 + 明确计费耗尽 code（14018，IsBillingExhausted）—— 精确业务 code 优先于
+//     状态码兜底。上游用 **429** 承载余额耗尽（实测 body：
+//     {"code":14018,"msg":"Credits exhausted..."}），若直接落到第 5 层的 429 兜底
+//     会被判 ErrSoftRate（限流）→ 只软冷却一个 soft_rate（600s）便回池，余额耗尽
+//     的账号被反复选中、每次必失败。只认精确 code，不认 "quota exceeded" 这类
+//     跨计费/限流两界的模糊措辞——那正是第 5 层要保护的情形。
+//  5. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
 //     "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把
 //     限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词
-//     更权威的信号；真正的余额耗尽由 402（第 1 层）捕获，非 429 状态码的 quota
-//     措辞仍走下方 hardMarkers（第 5 层）。
-//  5. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
-//  6. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     更权威的信号；真正的余额耗尽由 402（第 1 层）与 14018（第 4 层）捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 6 层）。
+//  6. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//  7. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码。
-//  7. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//  8. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
 //     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
-//  8. 404 / 5xx —— 与限流无关的常规分类。
-//  9. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  9. 404 / 5xx —— 与限流无关的常规分类。
+//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
-//  10. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
@@ -442,12 +537,23 @@ func Classify(status int, body string) ErrKind {
 			return ErrAccountFault
 		}
 	}
+	// 429 + 明确计费耗尽 code（14018 Credits exhausted）——必须先于下方 429 兜底。
+	// 上游用 429 承载余额耗尽（实测 body：{"error":{"data":{"code":14018,"msg":
+	// "Credits exhausted..."}}}）。若落到下面的 status==429 兜底会被判 ErrSoftRate
+	// ——只软冷却一个 soft_rate（默认 600s）便回池，余额耗尽的账号被反复选中且
+	// 每次必失败（2026-09-21 诊断：global 池两个 0 额度号反复出现在 429 soft_rate
+	// 日志里）。判 ErrHardCredit 才能让它退出轮换。
+	// 只认精确业务 code；"quota exceeded" 这类跨计费/限流两界的模糊措辞仍走下方
+	// 429 限流兜底（保持原有防误判语义不变）。
+	if status == http.StatusTooManyRequests && IsBillingExhausted(body) {
+		return ErrHardCredit
+	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
 	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
 	// ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词更权威的
 	// 信号：上游既然给了 429，就按限流语义处理（宁可短冷却自愈，不可长冷却弃号）；
-	// 真正的余额耗尽由 402（上层）捕获，非 429 状态码的 quota 措辞仍走下方
-	// hardMarkers（历史语义不变）。
+	// 真正的余额耗尽由 402（上层）与 14018（上一分支）捕获，非 429 状态码的 quota
+	// 措辞仍走下方 hardMarkers（历史语义不变）。
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
@@ -540,6 +646,16 @@ type Client struct {
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
+
+	// catalogMu/catalog 缓存各 realm 最近一次探测到的**全量模型目录**
+	// （企业端点 data.models，仅按 nonChatModel 剔除，不受 agents[cli] 白名单限制）。
+	// 用途：给 config.models.extra_* 的补充项回填上游元数据（name/description/
+	// credits/maxInputTokens/maxOutputTokens/能力旗标等）。这些模型上游能调通、
+	// 却不在 cli 白名单里，靠 FetchModels 的返回值拿不到它们的富字段。
+	// 与 FetchModels / global 探测同一轮写入，**零额外上游请求**。
+	// 按 realm 分层桶（同 efforts 的 C-2 隔离原则）。见 catalog.go。
+	catalogMu sync.RWMutex
+	catalog   map[string]map[string]ModelInfo
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
@@ -1238,6 +1354,10 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 		dynMap[m.ID] = m
 	}
+	// 全量目录落 catalog（含 cli 白名单外的条目）：供 config.models.extra_cn 的
+	// 补充项回填权威元数据（name/description/credits/maxInputTokens 等）。
+	// dynMap 已剔除非对话模型，正是"可对话的全量目录"。零额外上游请求。
+	c.storeCatalog(a.Realm(), catalogFromDyn(dynMap))
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
 		if m, ok := dynMap[id]; ok && !m.Disabled {

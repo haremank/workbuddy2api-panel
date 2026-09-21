@@ -363,6 +363,12 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelI
 		return nil, nil, fmt.Errorf("global models status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	names, infos, _, _, err := parseGlobalModelNames(raw)
+	if err == nil {
+		// 全量目录落 catalog：global 侧当前 data.models 与 agents[cli] 白名单等长
+		// （18 = 18，2026-09-21 实测），暂无"被挡掉的"条目；留存是为了上游日后
+		// 收紧白名单时，extra_global 的补充项能自动拿回权威元数据。
+		c.storeCatalog(a.Realm(), infos)
+	}
 	return names, infos, err
 }
 

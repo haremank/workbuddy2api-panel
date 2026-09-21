@@ -80,6 +80,23 @@ type Config struct {
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
 
+	// Models 模型名单的运维补充/屏蔽表（2026-09-21 加，WB2API-MODELS-SUPPLEMENT）。
+	//
+	// 为什么需要它：上游目录与"实际可调"并不一致（逐模型实测）——
+	// CN 侧有 5 个上游能调通但不在 /v1/models 里（被 agents[cli] 过滤掉），
+	// global 侧有 2 个列在目录里但上游恒 11102。二者都不是 realm 过滤能解决的。
+	//
+	// 语义是**纯补充**：动态探测失败仍返回空名单，不引入静态兜底。
+	// 四项全空 = 不做任何改动（对老配置零影响）。改完即时生效（无需重启）。
+	Models struct {
+		// ExtraCN / ExtraGlobal 追加进名单的模型 id（去重，排在动态结果之后）。
+		ExtraCN     []string `json:"extra_cn"`
+		ExtraGlobal []string `json:"extra_global"`
+		// HideCN / HideGlobal 从名单里剔除的模型 id（上游目录里存在但实测不可用）。
+		HideCN     []string `json:"hide_cn"`
+		HideGlobal []string `json:"hide_global"`
+	} `json:"models"`
+
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
