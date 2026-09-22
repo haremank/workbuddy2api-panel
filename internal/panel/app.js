@@ -970,7 +970,7 @@ function pbRow(r) {
   let tag;
   if (r.ok) tag = '<span class="tag ok">可用</span>';
   else if (r.code === '14018') tag = '<span class="tag bad">额度耗尽</span>';
-  else if (r.code === '14003') tag = '<span class="tag warn">模型限流</span>';
+  else if (r.code === '14003') tag = '<span class="tag warn">瞬时限流</span>';
   else if (r.code === '11102') tag = '<span class="tag mute">模型不存在</span>';
   else if (r.status < 0) tag = '<span class="tag bad">连不上</span>';
   else tag = '<span class="tag warn">HTTP ' + r.status + '</span>';
@@ -998,9 +998,17 @@ function pbRender(st) {
   if (st.running) {
     el.textContent = '进行中 ' + st.done + ' / ' + st.total + ' · ' + dur((st.elapsed_ms || 0) / 1000);
   } else if (st.total) {
-    el.textContent = '可用 ' + (sum.ok || 0) + ' · 额度耗尽 ' + (sum.hard_credit || 0) +
-      ' · 模型限流 ' + (sum.model_rate || 0) + ' · 其它 ' + (sum.other || 0) +
+    const done = st.done || 0, total = st.total || 0;
+    // 样本不完整必须**显式说出来** —— "看到 4 行全非 200" 与 "6 个组合全废" 是完全不同的结论。
+    // 被中途「停止」掐掉的组合**从未被观测过**，不能计入任何判断；少报这一句就会让人
+    // 把"没测"读成"测了且失败"（2026-09-22 hy4-preview-f 误报就是这么来的）。
+    const partial = done < total
+      ? '⚠️ 仅完成 ' + done + ' / ' + total + '，剩余 ' + (total - done) + ' 个组合「未测」（不计入结论） · '
+      : '';
+    el.textContent = partial + '可用 ' + (sum.ok || 0) + ' · 额度耗尽 ' + (sum.hard_credit || 0) +
+      ' · 瞬时限流 ' + (sum.model_rate || 0) + ' · 其它 ' + (sum.other || 0) +
       ' · 耗时 ' + dur((st.elapsed_ms || 0) / 1000) + (st.note ? ' · ' + st.note : '');
+    el.style.color = partial ? 'var(--warn)' : '';
   } else {
     el.textContent = '';
   }

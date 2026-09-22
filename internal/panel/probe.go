@@ -84,11 +84,21 @@ var probeRealmModels = map[string][]string{
 	"global": {"global:deepseek-v4.1-flash", "global:hy4-preview-f"},
 }
 
-// probeModelCooldown 探针判定「模型级限流（14003）」时写入的模型冷却时长。
+// 探针**不写回** 14003（2026-09-22 round13 起）。
 //
-// 与 handler.softCooldown 的默认值保持一致（600s）。panel 侧拿不到 live 配置，
-// 故用同一默认值 —— 宁可两处都取默认，也不要让探针与真实请求路径给出两套冷却语义。
-const probeModelCooldown = 600 * time.Second
+// 上游原文 `{"code":14003,"msg":"too many requests"}` 是**速率**信号，不是可用性结论：
+// 它说的是「(账号, 模型) 这一对此刻用量/速率超了」，实测 25s~4min 自愈，且**不给重置时刻**。
+// `internal/upstream/client.go:198-207` 有原项目自己的实测数据：同一号在两个 hy4 档上结果
+// **正好相反** ⇒ 既不是"模型全局不可用"，也不是"账号有问题"。
+//
+// 旧行为是拿到 14003 就写 600s 模型冷却（常量 `probeModelCooldown`，已删）。问题在**采样方式**：
+// `probeOne` 每对**只打一次**，而 `pool/cooldown.go:143-152` 的 `until` 取 `max(新,旧)` **只增不减**
+// ⇒ 一次 30 秒拥塞被固化成 10 分钟本地避让，面板显示"全部失效"、选号器真的绕开 —— **探测自己制造故障**。
+// `probe_test.go` 的串行断言注释早就写明：「并发会把免费档打成 14003，测到的是探针自己的副作用」。
+//
+// 真实流量遇 14003 仍走 handler F1 的模型级有界退避（`handler.go:1054`）—— 那是按**真实需求**
+// 退避，比探针的合成 burst 可信。探针只报告，不改池状态。
+const probeRateLimitNotWrittenBack = "瞬时限流，未写回（账号与模型均不受影响）"
 
 // reProbeCode 从上游响应体提取业务 code（14018 / 14003 / 11102 …）。
 // 纯展示用途：面板只把它显示给人看，**不据此做任何路由或池状态决策**。
@@ -456,7 +466,8 @@ func (p *Panel) probeOne(ctx context.Context, uid, realm, model, bare string) pr
 //	200         → NoteSuccess + ModelCooldownClear + ProbeCooldownClear：
 //	              该号该模型实测通，解除模型级避让，并撤销 12h 前的额度耗尽结论
 //	              （14018 是账号级判据，任一模型实测通即足以证伪整条结论）
-//	429 + 14003 → CooldownModelRateLimit：模型级冷却，**账号不连坐**（与 handler F1 同语义）
+//	429 + 14003 → **不写回**：速率信号（实测 25s~4min 自愈、不给重置时刻），
+//	              单样本不足以判定可用性 ⇒ 只报告，不动池状态（见文件头说明）
 //	429 + 14018 → CooldownProbe：账号级出池，有效期固定 ProbeVerdictTTL（12h）
 //	其它        → 不写回
 //
@@ -490,8 +501,10 @@ func (p *Panel) applyProbeResult(uid, bare string, row probeRow) string {
 	}
 	switch row.Code {
 	case "14003":
-		p.cfg.Pool.CooldownModelRateLimit(uid, probeModelCooldown, bare, "14003 probe model rate limit")
-		return "该模型已冷却 " + probeModelCooldown.String() + "（账号不受影响）"
+		// 见文件头「探针不写回 14003」：速率信号不是可用性结论，单样本写回会误伤好号。
+		// 这里仍然返回非空 —— 面板的「写回」列存在的意义就是把"探测到了"与"已影响选号"
+		// 分开显示，所以要把"刻意不写"这个**决定**说清楚，而不是留一个空格让人猜。
+		return probeRateLimitNotWrittenBack
 	case "14018":
 		// 只读余额查询：既给运维一个具体数字，又做**自校验**（余额仍有 ⇒ 14018 另有原因，
 		// 不写结论）。查询失败不阻断——一手 14018 证据本身已足够出池。
@@ -526,7 +539,7 @@ func probeNote(code, kind string, status int) string {
 	case "14018":
 		return "账号额度耗尽（连免费档也不豁免）"
 	case "14003":
-		return "该模型在此号被限流（模型级，同号其它模型不受影响）"
+		return "该模型此刻瞬时限流（速率类，实测 25s~4min 自愈；不写回选号器）"
 	case "11102":
 		return "该后端无此模型"
 	}

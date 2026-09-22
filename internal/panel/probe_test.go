@@ -170,6 +170,64 @@ func waitProbeDone(t *testing.T, p *Panel) map[string]any {
 	return nil
 }
 
+// probeAppliedOf 取某模型那一行的「写回选号器」列文本（空 = 该行没有写回动作）。
+func probeAppliedOf(t *testing.T, st map[string]any, model string) string {
+	t.Helper()
+	rows, _ := st["rows"].([]any)
+	for _, r := range rows {
+		m, _ := r.(map[string]any)
+		if m["model"] == model {
+			s, _ := m["applied"].(string)
+			return s
+		}
+	}
+	t.Fatalf("结果表里没有 %s 这一行：%v", model, st["rows"])
+	return ""
+}
+
+// TestProbeRateLimitIsNotWrittenBack 对抗性锚点（round13）：14003 **绝不**改池状态。
+//
+// 背景：2026-09-22 用户报「global:hy4-preview-f 全部失效，但实测可以使用」。查实是**误报** ——
+// 探针每对只打一次，撞上瞬时 14003 就写 600s 模型冷却，而 `pool/cooldown.go:143-152` 的
+// `until` 取 `max(新,旧)` **只增不减** ⇒ 一次 30 秒拥塞被固化成 10 分钟本地避让。
+// 更讽刺的是探针自己就是制造者：`TestProbeRunsSeriallyWithInterval` 的注释早写明
+// 「并发会把免费档打成 14003，测到的是探针自己的副作用」。
+//
+// 这条测试用**连续两轮 14003** 来验"不写回"：若有人恢复写回，第一轮就会红；
+// 即便有人改成"只在第二轮写回"（累积式误判），第二轮也会红。
+func TestProbeRateLimitIsNotWrittenBack(t *testing.T) {
+	const uid = "cn-1"
+	fake := &probeRoundTripper{byModel: map[string]probeResp{
+		"m-rate": {429, `{"code":14003,"msg":"too many requests"}`},
+	}}
+	p := newProbePanel(t, fake, &auth.Auth{UID: uid})
+
+	before := len(p.cfg.Pool.AvailableUIDs())
+	for i := 1; i <= 2; i++ {
+		probeDo(t, p, "POST", "/panel/api/probe/start", `{"models":["m-rate"]}`)
+		st := waitProbeDone(t, p)
+
+		if mcs := p.cfg.Pool.ModelCooldowns(uid); len(mcs) != 0 {
+			t.Fatalf("第 %d 轮：14003 后模型冷却表必须为空，实际 %v", i, mcs)
+		}
+		// 账号级状态也不能被碰：14003 既不是账号额度耗尽，也不该触发探针结论。
+		if _, _, ok := p.cfg.Pool.ProbeVerdictOf(uid); ok {
+			t.Fatalf("第 %d 轮：14003 不得留下探针结论（那是 14018 的语义）", i)
+		}
+		if n := len(p.cfg.Pool.AvailableUIDs()); n != before {
+			t.Fatalf("第 %d 轮：可用号数 %d → %d，14003 不得让账号出池", i, before, n)
+		}
+		// 报告要如实：这一列非空但写明"未写回"。
+		if applied := probeAppliedOf(t, st, "m-rate"); !strings.Contains(applied, "未写回") {
+			t.Fatalf("第 %d 轮：写回列须写明未写回，实际 %q", i, applied)
+		}
+	}
+	// 用户可读的判定文案也必须说清"这是速率类、会自愈"，不能让人读成"模型不可用"。
+	if note := probeNote("14003", "", 429); !strings.Contains(note, "瞬时限流") {
+		t.Errorf("14003 的判定文案应说「瞬时限流」，实际 %q", note)
+	}
+}
+
 // TestProbeDoesNotRunByItself 最关键的一条：**面板起来不会自己跑探针**。
 //
 // 用户明确要求"不要主动测试"。这条测试是那条约束的锚点——任何人加 ticker /
@@ -459,7 +517,7 @@ func TestProbeNoAutoRunAfterFinish(t *testing.T) {
 // 用户 2026-09-21 要求「探针结果要计入账号自动切换器，额度不够的不再接入」。
 // 三条路径各验一次：
 //
-//	14003 → 该号该模型进入模型级冷却（账号不连坐）
+//	14003 → **不写回**（round13）：速率信号、实测 25s~4min 自愈、单样本不足以下结论
 //	200   → 该号该模型冷却被清除（实测恢复比任何墙钟权威）
 //	14018 → 账号级出池，**有效期 12h**；余额读数只做自校验，不写回
 func TestProbeAppliesResultsToPool(t *testing.T) {
@@ -478,14 +536,27 @@ func TestProbeAppliesResultsToPool(t *testing.T) {
 	}
 	p := newProbePanel(t, fake, &auth.Auth{UID: uid})
 
-	// 1) 14003 → 模型级冷却
+	// 1) 14003 → **刻意不写回**（round13）。上游原文是 `too many requests`（速率信号，
+	//    实测 25s~4min 自愈、不给重置时刻），探针每对只打一次 ⇒ 单样本不足以判定可用性。
+	//    这条断言是"把写回改回去"的哨兵：一旦有人恢复 CooldownModelRateLimit，立刻变红。
 	probeDo(t, p, "POST", "/panel/api/probe/start", `{"models":["m-rate"]}`)
-	waitProbeDone(t, p)
-	if mcs := p.cfg.Pool.ModelCooldowns(uid); mcs["m-rate"] == "" {
-		t.Fatalf("14003 后应写入 m-rate 模型冷却，实际 %v", mcs)
+	st1 := waitProbeDone(t, p)
+	if mcs := p.cfg.Pool.ModelCooldowns(uid); mcs["m-rate"] != "" {
+		t.Fatalf("14003 不得写回模型冷却（速率信号≠可用性结论），实际 %v", mcs)
+	}
+	// 但"刻意不写"这个**决定**必须显示出来 —— 否则面板的写回列是空的，
+	// 运维分不清"没写回"与"没探测到"。
+	if applied := probeAppliedOf(t, st1, "m-rate"); !strings.Contains(applied, "未写回") {
+		t.Fatalf("14003 的写回列须说明刻意未写回，实际 %q", applied)
 	}
 
-	// 2) 该模型实测恢复 → 冷却被清除
+	// 2) 该模型实测恢复 → **既有**避让被清除（写回规则里 200 这一条仍然要生效）。
+	//    先手工种一条模型级避让（等价于真实流量 handler.go:1054 写的 14003 退避），
+	//    再让探针实测 200 —— 必须清掉，否则面板会自相矛盾（探针说通、选号器仍绕开）。
+	p.cfg.Pool.CooldownModelRateLimit(uid, time.Minute, "m-rate", "14003 model rate limit")
+	if mcs := p.cfg.Pool.ModelCooldowns(uid); mcs["m-rate"] == "" {
+		t.Fatalf("前置条件：应已种入 m-rate 冷却，实际 %v", mcs)
+	}
 	//（BlockModelClear 只清 11102 前缀，清不掉 14003 ⇒ 必须走 ModelCooldownClear）
 	fake.byModel["m-rate"] = probeResp{200, "data: {\"choices\":[]}\n\n"}
 	probeDo(t, p, "POST", "/panel/api/probe/start", `{"models":["m-rate"]}`)

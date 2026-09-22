@@ -249,3 +249,55 @@ func TestProbeWritebackUIContract(t *testing.T) {
 		t.Errorf("探针表列数不匹配：表头 %d 个 <th>，pbRow 渲染 %d 个 <td>", thCount, tdCount)
 	}
 }
+
+// TestProbePartialSampleAndRateLimitLabels round13 新增的两条前端契约（2026-09-22）。
+//
+// 起因是用户报「global:hy4-preview-f 全部失效」—— 查实为**误报**。界面侧有两个"让人读错"的原因：
+//
+//  1. **样本不完整不提示**：那次探针 total=6 done=4（用户中途点了「停止」），漏掉的组合
+//     **从未被观测过**，但面板只列 4 行非 200 ⇒ 被读成"全部失效"。所以 done<total 时
+//     必须**显式**写出"仅完成 N/M、剩余未测、不计入结论"。
+//  2. **14003 被标成「模型限流」**：字面像"这个模型被限了/不可用"，真实语义却是
+//     "此刻速率超了、25s~4min 自愈"。改标「瞬时限流」，且**不得**与「额度耗尽」同色同类。
+//
+// 两条都只锚 UI 文案，不碰判定逻辑（判定在 probe.go）。
+func TestProbePartialSampleAndRateLimitLabels(t *testing.T) {
+	js := string(appJS)
+
+	// 只锚 **pbRender 函数体内**的片段。⚠️ 不要退回成"整文件 Contains"：
+	// `done < total` 这类片段在别处（或变异后）仍可能存在，断言会空转 ——
+	// round13 首版就这么写的，变异测试（把条件改成 `false && done < total`）照样绿。
+	start := strings.Index(js, "function pbRender(st) {")
+	if start < 0 {
+		t.Fatal("app.js 里找不到 pbRender")
+	}
+	body := js[start:]
+	if e := strings.Index(body, "\n}"); e > 0 {
+		body = body[:e]
+	}
+
+	// 1. 样本不完整提示：条件式必须**真的**是 done<total，且输出里必须出现"未测/不计入结论"。
+	if !strings.Contains(body, "const partial = done < total") {
+		t.Error("pbRender 未按 done<total 判定样本不完整 —— 漏测的组合会被读成「测了且失败」")
+	}
+	if !strings.Contains(body, "未测") || !strings.Contains(body, "不计入结论") {
+		t.Error("样本不完整的提示文案不完整（必须写明「未测」且「不计入结论」）")
+	}
+	if !strings.Contains(body, "el.style.color = partial ?") {
+		t.Error("样本不完整时未做视觉强调（partial 只影响文案、不影响观感）")
+	}
+	if !strings.Contains(js, "瞬时限流") {
+		t.Error("app.js 未把 14003 标为「瞬时限流」（旧文案「模型限流」易被读成模型不可用）")
+	}
+	if strings.Contains(js, "模型限流") {
+		t.Error("app.js 仍残留「模型限流」旧文案")
+	}
+	// 14003 与 14018 必须落在不同的视觉档：一个是速率（warn），一个是余额（bad）。
+	i := strings.Index(js, "r.code === '14003'")
+	if i < 0 {
+		t.Fatal("app.js 里找不到 14003 的渲染分支")
+	}
+	if seg := js[i:min(i+80, len(js))]; !strings.Contains(seg, "warn") {
+		t.Errorf("14003 应渲染成 warn（瞬时限流），实际片段 %q", seg)
+	}
+}
