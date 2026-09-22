@@ -94,30 +94,44 @@ func (p *Pool) Revive(uid string) bool {
 	return true
 }
 
-// reviveCoolingLocked 只清冷却（until/coolKind/reason/softStreak）并更新 credits，不动熔断器
-// （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
-// billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
-// softStreak 属**冷却域**（与 until/coolKind 同域），故随冷却一并清零——与"解冻只清冷却
-// 不清熔断"的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是历史软冷却累积。
+// ReenableIfCredits 余额刷新的统一入口：把**权威余额读数**写回账号，并且仅在账号
+// **确实处于账号级冷却**时执行复活迁移（清冷却域）。
+//
+// 🔴 为什么必须判「是否真的在冷却」（2026-09-22 修）：本函数是**常规余额刷新回调**，
+// 不是"复活事件"回调 —— `scheduler.go RunBalanceRefreshNow` 每 5 分钟一轮遍历**全部**
+// 非禁用账号（线上 `schedule.balance_refresh_minutes=5`），对每个查询成功的账号都调它。
+// 不加判定就无条件走 reviveCoolingLocked 时，`clearCoolingLocked` 会连 `modelCooldowns`
+// 一起清（transition.go:36）⇒ **模型级冷却（6004/14003 避让、11102 负缓存）每 5 分钟被
+// 无条件清空**，模型级隔离（F1）实际失效，且与 NoteSuccess 声明的"不碰 modelCooldowns、
+// 每模型独立计时"契约自相矛盾。
+// 线上决定性实验（2026-09-22 14:53）：探针写入的 10 分钟模型冷却，被一次 balance 刷新即清空。
+//
+// 复活迁移本身的语义**不变**：只清冷却域（until/coolKind/reason/softStreak/modelCooldowns），
+// 不动熔断器（fails/retryCount/breakerUntil）—— 签到/充值只证明余额恢复与 billing 通道健康，
+// 不证明 chat 通道健康，熔断（连续 5xx 信号）不应被覆盖。
 // 调用方必须已持有 p.mu。
 func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain, total) // 内部置 creditsKnown
-		} else {
-			e.credits = remain
-			e.creditsTotal = total
-			// remain == 0（或已禁用）也走这里：查询成功过，故余额是权威的 0
-			// ⇒ 置 creditsKnown 让选号侧把它当作"已耗尽"出池（healthy 的余额判据）。
-			// 这正是"余额刷新发现耗尽后把号摘出轮换"的落点——修复前只赋值不冷却，
-			// 0 额度号会一直留在池里被反复选中。
-			e.creditsKnown = true
-			e.creditsUpdated = time.Now()
-		}
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	// 余额先无条件写回（查询成功过 ⇒ 权威读数，含 remain==0）：
+	// 置 creditsKnown 让选号侧把 remain==0 当作"已耗尽"出池（healthy 的余额判据）。
+	// 这正是"余额刷新发现耗尽后把号摘出轮换"的落点——修复前只赋值不冷却，
+	// 0 额度号会一直留在池里被反复选中。
+	e.credits = remain
+	e.creditsTotal = total
+	e.creditsKnown = true
+	e.creditsUpdated = time.Now()
+	// 复活迁移：仅在"有账号级冷却可解"时执行。until 非零即冷却域处于非默认态
+	// （含已过期但尚未清理的残留，一并归一化）；账号本就健康时无可复活，
+	// 不得借机清掉模型级独立冷却。
+	if remain > 0 && !e.disabled && !e.until.IsZero() {
+		p.reviveCoolingLocked(e, remain, total) // 幂等重写 credits 四件套 + 清冷却域
+	}
+	p.dirty.Store(true)
 }
 
 // NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal。

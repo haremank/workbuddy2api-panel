@@ -359,7 +359,7 @@ func TestProbeRejectsTooManyPairs(t *testing.T) {
 // TestProbeEmptyModelsUsesRealmDefaults 空 models → 按账号所属 realm 取默认模型。
 //
 // 这是「国内版和国外版探针不一样」的锚点：同一个空请求，cn 号只探 cn 档、
-// global 号探 global 三档。分流发生在服务端，前端不需要知道差异，也不会抄错。
+// global 号探 global 两档。分流发生在服务端，前端不需要知道差异，也不会抄错。
 func TestProbeEmptyModelsUsesRealmDefaults(t *testing.T) {
 	// global 号 → global 默认档
 	fake := &probeRoundTripper{byModel: map[string]probeResp{}}

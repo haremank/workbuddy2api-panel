@@ -182,8 +182,14 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
 	}
 }
 
-// TestModelCooldownsClearedByRevive 签到解冻（reviveCoolingLocked）→ 模型级 6004 冷却清零。
-func TestModelCooldownsClearedByRevive(t *testing.T) {
+// TestModelCooldownsPreservedByRoutineBalanceRefresh 常规余额刷新**不得**清模型级冷却。
+//
+// 2026-09-22 契约变更：ReenableIfCredits 是每 5 分钟一轮的**常规余额刷新回调**
+// （scheduler.go RunBalanceRefreshNow 遍历全部非禁用账号），不是"复活事件"回调。
+// 账号本来就健康、只是某模型被 6004/14003 限流时，刷新不得把该模型的避让清掉 ——
+// 否则模型级隔离（F1）与 11102 负缓存的实际寿命都只剩一个刷新周期（5 分钟）。
+// 线上决定性实验（2026-09-22 14:53）：探针写入的 10 分钟模型冷却被一次 balance 刷新即清空。
+func TestModelCooldownsPreservedByRoutineBalanceRefresh(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
@@ -191,8 +197,29 @@ func TestModelCooldownsClearedByRevive(t *testing.T) {
 	p.mu.RLock()
 	n := len(p.byUID["u1"].modelCooldowns)
 	p.mu.RUnlock()
+	if n != 1 {
+		t.Errorf("常规余额刷新后 modelCooldowns=%d want 1（模型级冷却必须保留）", n)
+	}
+	// 账号级冷却域本就为默认态，刷新不该制造冷却。
+	if st, _ := p.Status("u1"); st.Cooling {
+		t.Error("账号本就健康，余额刷新不该制造账号级冷却")
+	}
+}
+
+// TestModelCooldownsClearedByAccountCoolingRevive 账号**确实处于账号级冷却**时，
+// 余额恢复触发的复活迁移仍须把冷却域整体归零（含模型级 6004 冷却）——
+// 保住 2026-09-22 变更之前就有的原语义（原 TestModelCooldownsClearedByRevive）。
+func TestModelCooldownsClearedByAccountCoolingRevive(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, 600*time.Second, "429") // 账号级冷却：置 until
+	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
+	p.ReenableIfCredits("u1", 500, 0)
+	p.mu.RLock()
+	n := len(p.byUID["u1"].modelCooldowns)
+	p.mu.RUnlock()
 	if n != 0 {
-		t.Errorf("revive 后 modelCooldowns=%d want 0", n)
+		t.Errorf("账号级冷却复活后 modelCooldowns=%d want 0", n)
 	}
 }
 

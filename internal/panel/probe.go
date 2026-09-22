@@ -156,7 +156,7 @@ type probeSnapshot struct {
 	Summary   probeSummary `json:"summary"`
 	Note      string       `json:"note,omitempty"`
 	// DefaultModels 各 realm 的默认探测模型：请求体不传 models 时，按每个账号**所属
-	// realm** 自动取（国内版只探 cn 档，国际版探 global 三档）。前端从这里取，
+	// realm** 自动取（国内版只探 cn 档，国际版探 global 两档）。前端从这里取，
 	// **不在 JS 里再抄一份**——抄两份就会漂移（今天刚在 handler/panel 的 catalog 上栽过）。
 	DefaultModels map[string][]string `json:"default_models"`
 	// MaxPairs / IntervalMS / MaxConcurrency 供前端做"将发起 N 次调用"的预估与提示。
@@ -185,8 +185,11 @@ func (p *Panel) probeStart(w http.ResponseWriter, r *http.Request) {
 	// body 可空：空 body 用默认值。限制 64KB 防异常请求。
 	_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req)
 
-	// models 可空 ⇒ 按每个账号**所属 realm** 取默认（国内版只探 cn 档，国际版探 global 三档）。
+	// models 可空 ⇒ 按每个账号**所属 realm** 取默认（国内版只探 cn 档，国际版探 global 两档）。
 	// 这正是"国内版和国外版探针不一样"的落点：同一份配置，按号分域自动分流。
+	// ⚠️ 原注释误写"global 三档"（与 probeRealmModels 实际两档不符，2026-09-22 修正）。
+	// `hy3` 虽也是 0x 免费档，但用户 2026-09-22 明确「这个模型我基本不用」⇒ 不进默认档；
+	// 需要时在面板显式填 `global:hy3` / `cn:hy3` 仍可探。
 	models := normalizeProbeModels(req.Models)
 	if p.cfg.Pool == nil {
 		writeErr(w, http.StatusServiceUnavailable, "no pool")
