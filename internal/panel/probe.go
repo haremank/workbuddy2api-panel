@@ -32,15 +32,11 @@ import (
 //     不再接入」）。写回规则见 applyProbeResult：只对语义明确的结果动手，上游抖动一律不写回。
 //     **账号级结论带 12h TTL**（用户补充：「探测记录值保存 12 小时，之后默认恢复可以被
 //     切换器选择」）——探针是一次快照而非持续观测，没有 TTL 就会把好号永久钉在池外。
-//     代价：探针消耗的上游限额网关不记账，所以**并发与总量都必须压住**（见下方常量），
-//     否则探针自己会把免费档打到限流，反而制造假故障。
+//     代价：探针消耗的上游限额网关不记账，所以**必须串行执行（并发恒为 1）+ 固定间隔 +
+//     总量上限**（见下方常量），否则探针自己会把免费档打到限流，反而制造假故障。
 //  4. **互斥**。同一时刻只允许一个探针在跑，重复点击返回 409，避免并发打爆上游。
 
 const (
-	// probeMaxConcurrency 探针并发上限。免费档（尤其 hy4 系）的 per-model 限额很紧，
-	// 并发过高会让探针自己触发 14003 —— 那测到的是探针的副作用，不是真实可用性。
-	probeMaxConcurrency = 3
-
 	// probeMaxPairs 单次探针的组合数上限（账号 × 模型）。防手滑勾成全量（7×52=364）
 	// 把上游限额打光。超限直接拒绝，不截断（静默截断会让人误以为"全测过了"）。
 	probeMaxPairs = 120
@@ -52,6 +48,17 @@ const (
 	// 这里只是防御上游异常长流把内存吃满。
 	probeDrainLimit = 256 << 10
 )
+
+// probeInterval 相邻两次探测之间的固定间隔。**探针全程串行，并发恒为 1。**
+//
+// 用户 2026-09-22 要求「探针一个个账号测试，设计间隔，不要并发」。理由与原先"压并发"一样，
+// 只是更彻底：免费档（尤其 hy4 系）的 per-model 限额很紧，连发会把探针自己打成 14003 ——
+// 那测到的是**探针的副作用**，不是账号的真实可用性。串行 + 间隔后每个结论彼此独立，
+// 代价是单次全量（120 组合）约 3 分钟；探针本就是人工点击的低频运维动作，这个代价值得。
+//
+// 声明为 var 而非 const：单测要把它压到毫秒级才能在合理时间内验证"确实串行"。
+// **生产代码不得改写它。**
+var probeInterval = 1500 * time.Millisecond
 
 // probeRealmModels 各 realm 的默认探测模型（用户 2026-09-21 指定「国内版和国外版探针不一样」）：
 //   - 国内版：只探 deepseek-v4.1-flash
@@ -152,8 +159,11 @@ type probeSnapshot struct {
 	// realm** 自动取（国内版只探 cn 档，国际版探 global 三档）。前端从这里取，
 	// **不在 JS 里再抄一份**——抄两份就会漂移（今天刚在 handler/panel 的 catalog 上栽过）。
 	DefaultModels map[string][]string `json:"default_models"`
-	// MaxPairs / MaxConcurrency 供前端做"将发起 N 次调用"的预估与提示。
+	// MaxPairs / IntervalMS / MaxConcurrency 供前端做"将发起 N 次调用"的预估与提示。
+	// 探针**串行**执行（用户 2026-09-22 要求不并发），所以 MaxConcurrency 恒为 1，
+	// 耗时由 IntervalMS 决定 —— 前端必须按"串行 + 间隔"估时，别再按并发数除。
 	MaxPairs       int `json:"max_pairs"`
+	IntervalMS     int `json:"interval_ms"`
 	MaxConcurrency int `json:"max_concurrency"`
 	// VerdictTTLSeconds 探针账号级结论的有效期（12h）。前端只展示，不参与计算 ——
 	// 真正的到期判定在 pool 侧（until 字段），这里透出是为了让运维知道
@@ -273,7 +283,8 @@ func (p *Panel) probeStatus(w http.ResponseWriter, r *http.Request) {
 		// 只读常量，直接引用即可（无人会改写 probeRealmModels）。
 		DefaultModels:     probeRealmModels,
 		MaxPairs:          probeMaxPairs,
-		MaxConcurrency:    probeMaxConcurrency,
+		IntervalMS:        int(probeInterval / time.Millisecond),
+		MaxConcurrency:    1, // 串行：并发恒为 1（见 probeInterval 注释）
 		VerdictTTLSeconds: int(pool.ProbeVerdictTTL / time.Second),
 	}
 	if !j.startedAt.IsZero() {
@@ -339,9 +350,10 @@ func (p *Panel) runProbe(ctx context.Context, pairs []probePair) {
 		j.mu.Unlock()
 	}()
 
-	sem := make(chan struct{}, probeMaxConcurrency)
-	var wg sync.WaitGroup
-	for _, pr := range pairs {
+	// 🔴 串行执行：**并发恒为 1**（用户 2026-09-22 明确要求「一个个账号测试，不要并发」）。
+	// 并发会让免费档被探针自己打成 14003 —— 那测到的是探针的副作用，不是账号的真实可用性。
+	// 每次探测之间睡 probeInterval；取消时不等满、立刻退出。
+	for i, pr := range pairs {
 		if ctx.Err() != nil {
 			break
 		}
@@ -349,19 +361,21 @@ func (p *Panel) runProbe(ctx context.Context, pairs []probePair) {
 		if acct == nil {
 			continue
 		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(uid, realm, model, bare string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			row := p.probeOne(ctx, uid, realm, model, bare)
-			j.mu.Lock()
-			j.rows = append(j.rows, row)
-			j.done++
-			j.mu.Unlock()
-		}(pr.uid, pr.realm, pr.model, pr.bare)
+		if i > 0 {
+			select {
+			case <-time.After(probeInterval):
+			case <-ctx.Done():
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		row := p.probeOne(ctx, pr.uid, pr.realm, pr.model, pr.bare)
+		j.mu.Lock()
+		j.rows = append(j.rows, row)
+		j.done++
+		j.mu.Unlock()
 	}
-	wg.Wait()
 }
 
 // probeOne 对单个 (账号, 模型) 发一次真实最小请求并判定。

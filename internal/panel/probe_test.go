@@ -35,6 +35,19 @@ type probeRoundTripper struct {
 	mu       sync.Mutex
 	calls    []string // 收到的 model 名（chat 请求）；非 chat 记 ""
 	nonChats int      // 非 chat 请求计数
+
+	// 并发观测（round10：探针改为串行，并发恒为 1）。**必须配 delay 使用** ——
+	// 请求若瞬时返回，即便真的并发也会记录到峰值 1，断言就成了空转。
+	inFlight    int
+	maxInFlight int
+	delay       time.Duration
+}
+
+// maxConcurrent 观测到的最大在途请求数（串行时应恒为 1）。
+func (f *probeRoundTripper) maxConcurrent() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxInFlight
 }
 
 // callsSnapshot 返回已记录的 model 名副本（含非 chat 请求的空串）。并发安全。
@@ -68,6 +81,21 @@ func (f *probeRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 			return mkProbeResp(*f.nonChat), nil
 		}
 		return mkProbeResp(probeResp{200, "data: {}\n\n"}), nil
+	}
+
+	f.mu.Lock()
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.inFlight--
+		f.mu.Unlock()
+	}()
+	if f.delay > 0 {
+		time.Sleep(f.delay) // 让请求占用一段时间，把并发暴露出来（否则断言空转）
 	}
 
 	f.mu.Lock()
@@ -585,5 +613,56 @@ func TestSplitProbeModel(t *testing.T) {
 		if r != c.realm || b != c.bare {
 			t.Errorf("splitProbeModel(%q)=(%q,%q) want (%q,%q)", c.in, r, b, c.realm, c.bare)
 		}
+	}
+}
+
+// TestProbeRunsSeriallyWithInterval 探针必须**串行**：并发恒为 1，且相邻探测之间有间隔。
+//
+// 用户 2026-09-22：「探针一个个账号测试，设计间隔，不要并发」—— 并发会把免费档打成
+// 14003，测到的是探针自己的副作用而不是账号可用性。这两条断言是防回归的：改回并发会立刻红。
+func TestProbeRunsSeriallyWithInterval(t *testing.T) {
+	old := probeInterval
+	probeInterval = 120 * time.Millisecond
+	defer func() { probeInterval = old }()
+
+	// delay > 0 是必须的：请求若瞬时返回，即便真的并发也会观测到峰值 1 ⇒ 断言空转。
+	fake := &probeRoundTripper{delay: 60 * time.Millisecond}
+	p := newProbePanel(t, fake,
+		&auth.Auth{UID: "gl-1", Domain: "www.workbuddy.ai"},
+		&auth.Auth{UID: "gl-2", Domain: "www.workbuddy.ai"},
+		&auth.Auth{UID: "gl-3", Domain: "www.workbuddy.ai"},
+		&auth.Auth{UID: "gl-4", Domain: "www.workbuddy.ai"},
+	)
+
+	start := time.Now()
+	probeDo(t, p, "POST", "/panel/api/probe/start", `{"models":["m-one"]}`)
+	st := waitProbeDone(t, p)
+	elapsed := time.Since(start)
+
+	if rows, _ := st["rows"].([]any); len(rows) != 4 {
+		t.Fatalf("rows=%d want 4（4 个账号 × 1 个模型）", len(rows))
+	}
+	if got := fake.maxConcurrent(); got != 1 {
+		t.Errorf("并发峰值=%d want 1 —— 探针必须串行；并发会把免费档打成 14003，"+
+			"测到的就是探针的副作用而非账号可用性", got)
+	}
+	// 4 次探测之间有 3 个间隔。下界断言：间隔没生效就会连发，撞免费档限额。
+	if want := 3 * probeInterval; elapsed < want {
+		t.Errorf("耗时 %v < 3×间隔 %v —— 间隔没生效（连发会撞免费档 per-model 限额）", elapsed, want)
+	}
+}
+
+// TestProbeStatusReportsSerialContract 状态接口必须把「串行 + 间隔」报给前端。
+// 前端靠 interval_ms 估时；若重新引入并发而不同步这个契约，面板会把耗时低估成 1/3。
+func TestProbeStatusReportsSerialContract(t *testing.T) {
+	fake := &probeRoundTripper{}
+	p := newProbePanel(t, fake, &auth.Auth{UID: "gl-1", Domain: "www.workbuddy.ai"})
+	_, out := probeDo(t, p, "GET", "/panel/api/probe/status", "")
+
+	if got, _ := out["max_concurrency"].(float64); got != 1 {
+		t.Errorf("max_concurrency=%v want 1（探针串行；前端按此估时）", out["max_concurrency"])
+	}
+	if got, _ := out["interval_ms"].(float64); got <= 0 {
+		t.Errorf("interval_ms=%v 应 > 0（前端用它算预计耗时）", out["interval_ms"])
 	}
 }

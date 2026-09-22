@@ -861,9 +861,11 @@ function pbPlan() {
   if (!el) return;
   const n = pbPairCount();
   const max = (pbStatus && pbStatus.max_pairs) || 120;
-  const conc = (pbStatus && pbStatus.max_concurrency) || 3;
+  // 探针**串行**：并发恒为 1，耗时由间隔决定（后端 probeInterval，默认 1.5s）。
+  // 别再用 max_concurrency 去除 —— 那会低估成 1/3，把「3 分钟」说成「1 分钟」。
+  const iv = ((pbStatus && pbStatus.interval_ms) || 1500) / 1000;
   if (!pbModelsList().length) {
-    // 留空是推荐用法：由服务端按号分域，国内只探 cn 档、国际探 global 三档。
+    // 留空是推荐用法：由服务端按号分域，国内只探 cn 档、国际探 global 两档。
     el.textContent = '模型留空 ⇒ 按域自动分流：' + pbDefaultSummary() +
       ' · 将发起 ' + n + ' 次真实调用 · 结果写回选号器（账号级结论 12h 有效，到期自动回轮换）';
     el.style.color = '';
@@ -871,8 +873,8 @@ function pbPlan() {
   }
   if (!n) { el.textContent = '当前范围下没有可测组合（检查 realm: 前缀与勾选的账号域是否匹配）'; return; }
   const warn = n > max ? '⚠️ 超过单次上限 ' + max + '，会被拒绝' : '将发起 ' + n + ' 次真实调用';
-  el.textContent = warn + ' · 并发 ' + conc + ' · 预计约 ' + Math.ceil(n / conc * 1.5) +
-    ' 秒 · 真实调用会消耗上游额度（探针消耗网关不记账）';
+  el.textContent = warn + ' · 串行逐个探测、每次间隔 ' + iv + 's · 预计约 ' +
+    Math.ceil(n * (iv + 1.5)) + ' 秒 · 真实调用会消耗上游额度（探针消耗网关不记账）';
   el.style.color = n > max ? 'var(--bad)' : '';
 }
 function pbRow(r) {
@@ -961,7 +963,7 @@ $('btnProbeRun').onclick = async () => {
     await api('probe/start', { method: 'POST', body: JSON.stringify({ models: models, uids: uids }) });
     $('pbBody').innerHTML = '';
     pbStartPoll();
-    toast('探针已启动（真实调用上游，请稍候）', 'ok');
+    toast('探针已启动（串行逐个调用上游，共 ' + n + ' 次，请稍候）', 'ok');
   } catch (e) {
     toast('启动失败：' + e.message, 'err');
     b.disabled = false; b.textContent = '开始探测';
