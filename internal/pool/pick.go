@@ -246,26 +246,21 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // ⇒ 排除纯粹来自模型级冷却。第二梯队只在第一梯队为空时启用 ⇒ 既有优先级零改动。
 //
 // 11102 负缓存两个梯队都排除（modelBackoffCooled）：那是上游确定性答复"没有"，试探无意义。
+//
+// 上述排除项（跨域/禁用/余额耗尽/额度耗尽冷却/11102）已抽成 rotationExcludedLocked
+// （retryafter.go），与 RetryAfterHint 共用：两者的候选集必须同源，否则客户端会按一个
+// 选号器永远不会去试的时刻退避。inFlightFull 不抽——它是秒级租约，只有兜底自己需要
+// （必须真能立刻租到号），不构成"何时恢复"的判断依据。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, reqModel string) *auth.Auth {
 	var best, bestModelCooled *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if realm != "" && e.a.Realm() != realm {
-			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
-		}
-		if e.disabled {
-			continue // 禁用的账号永不参与兜底
-		}
-		if e.creditsKnown && e.credits <= 0 {
-			continue // 余额已确认耗尽：调了必 14018，不参与兜底（等余额刷新解冻回池）
-		}
-		if (e.coolKind == CoolHard || e.coolKind == CoolProbe) && !e.until.IsZero() && now.Before(e.until) {
-			continue // 余额/额度耗尽号（处于有效冷却期）不参与兜底：调了必 402
-		}
-		if e.modelBackoffCooled(now, reqModel) {
-			continue // 该模型在此号上是 11102 负缓存（上游确定性答复"没有"）：试探无意义
+		// 跨域/禁用/余额耗尽/额度耗尽冷却/11102 负缓存：调了必失败，不参与兜底。
+		// 谓词与 RetryAfterHint 共用（见 retryafter.go），两者候选集必须同源。
+		if p.rotationExcludedLocked(e, now, realm, reqModel) {
+			continue
 		}
 		if p.inFlightFull(e) {
 			continue

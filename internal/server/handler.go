@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -949,6 +950,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusTooManyRequests
 			code = "rate_limit_exceeded"
 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
+			// Retry-After（round14 / N2）：上游明示优先，否则用池内最早恢复时刻，
+			// 两者都没有就不发该头（详见 setRetryAfter 注释）。必须在写 header 之前调用。
+			h.setRetryAfter(w, ue.RetryAfter, realm, bareModel)
 		case upstream.ErrWafBlock:
 			if h.wafIP.active() {
 				// IP 级拦截措辞（fail-fast 终止路径）：网关出口 IP 被 WAF 拦截、
@@ -1183,6 +1187,55 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 			"gateway_hint": hint,
 		},
 	})
+}
+
+// setRetryAfter 在 429 响应上写 Retry-After 头（round14 / N2）：告诉客户端「多久后可以再来」。
+//
+// 此前我们只把上游 Retry-After 用于**冷却时长**（applyErrorPolicy 的两处
+// CooldownSoftRate），从不回客户端 ⇒ OpenAI SDK / 各类网关拿不到退避依据，只能按自身
+// 经验值立刻重试，反复撞穿限流窗口（放大上游压力，客户端还误以为服务不可用）。
+// 兄弟项目 workbuddy2api-hub 的 429 路径正是「取重置时刻 → 记短冷却 → 换号 → 回客户端
+// 带 Retry-After」（见 RESEARCH-RATELIMIT-20260922.md）。
+//
+// 取值优先级（**绝不臆造数字**）：
+//  1. 上游给了（Retry-After / retry-after-ms / x-ratelimit-reset；upstream.ParseRetryAfter
+//     已解析并做过量纲与 2h 上限校验）→ 原样折算为秒；
+//  2. 上游没给 → 池内最早恢复时刻（Pool.RetryAfterHint，与全冷却兜底同源）；
+//  3. 两者都没有 → **不发该头**。编一个数字比不发更糟：客户端会在该重试时放弃，
+//     或过早重试继续撞限流。
+func (h *Handler) setRetryAfter(w http.ResponseWriter, upstreamWait time.Duration, realm, model string) {
+	src, val := "upstream", ""
+	if s, ok := retryAfterHeaderValue(upstreamWait); ok {
+		val = s
+	} else if d, ok := h.cfg.Pool.RetryAfterHint(realm, model); ok {
+		if s, ok := retryAfterHeaderValue(d); ok {
+			src, val = "pool", s
+		}
+	}
+	if val == "" {
+		return
+	}
+	w.Header().Set("Retry-After", val)
+	// 打一行日志：该头是新增的对外承诺，运维必须能在日志里看到「告诉客户端等多久、
+	// 依据来自哪一侧」（上游明示 vs 池内推导）；也是靶心验证在二进制里可 grep 的标记。
+	log.Printf("chat 429 retry-after=%ss src=%s realm=%s model=%s", val, src, realm, model)
+}
+
+// retryAfterHeaderValue 把等待时长折算成 Retry-After 头的值（RFC 7231 delta-seconds：
+// 十进制整数秒；HTTP-Date 形态客户端支持更参差，不采用）。d <= 0 → ok=false（调用方不发头）。
+// 向上取整而非截断：截断会让客户端早不到 1 秒重试、又撞上限流窗口。
+func retryAfterHeaderValue(d time.Duration) (string, bool) {
+	if d <= 0 {
+		return "", false
+	}
+	secs := int64(d / time.Second)
+	if d%time.Second != 0 {
+		secs++
+	}
+	if secs < 1 {
+		secs = 1
+	}
+	return strconv.FormatInt(secs, 10), true
 }
 
 // hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态
