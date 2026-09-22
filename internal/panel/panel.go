@@ -166,6 +166,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
+	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
@@ -380,120 +381,151 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
-// 无可用账号 503（先添加账号）；上游失败 502。
+// 与 /v1/models 同口径的双域输出：CN 域模型加 "cn:" 前缀、global 域加 "global:" 前缀
+// （gateway 路由协议，前端显示的 id 就是调用时要填的完整 model 值）。
+// 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
+// （有错误明细回 502，一个账号都没有回 503）。
 //
-// realm 分池（2026-09-21 修，WB2API-REALM-FIX）：?realm=cn|global，缺省 cn（保持
-// 历史语义）。历史实现用无过滤的 Pick()，池里 global 号占多数时会抽到 global 号，
-// 面板「模型」页把 global 目录当 CN 目录显示（与 handler.fetchDynamicModels 同源 bug）。
+// 各域名单再套 config.models 的补充/屏蔽表（见 applyModelOverrides）——面板展示的
+// 名单即客户端实际拿到的名单。
+//
+// 历史 bug（2026-09-21 WB2API-REALM-FIX）：原实现用无过滤的 Pool.Pick()，池里 global
+// 号占多数时会抽到 global 号，于是把 global 目录当 CN 目录显示（与
+// handler.fetchDynamicModels 同源）。现改为按域取号 + 双域独立探测。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	realm := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("realm")))
-	if realm != "global" {
-		realm = "cn"
-	}
-	var infos []upstream.ModelInfo
-	noAcct := false
-	if realm == "global" {
-		acct := p.cfg.Pool.PickExcludingForRealm(nil, "", "global")
-		if acct == nil {
-			noAcct = true
-		} else {
-			infos = p.cfg.Upstream.FetchGlobalModelInfos(acct)
-			if len(infos) == 0 {
-				// 窄表形态 / 富字段缺失：退化为裸 ID 名单（不编造字段），与
-				// /v1/models 的 global 分支同口径；共享同一次探测缓存，零额外上游调用。
-				for _, id := range p.cfg.Upstream.FetchGlobalModels(acct) {
-					infos = append(infos, upstream.ModelInfo{ID: id})
+	out := make([]map[string]any, 0)
+	var fetchErrs []string
+
+	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
+	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
+	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
+		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+			infos, err := p.cfg.Upstream.FetchModels(acct)
+			if err != nil {
+				fetchErrs = append(fetchErrs, "cn: "+err.Error())
+			} else {
+				for _, mi := range p.applyModelOverrides("cn", infos) {
+					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
 				}
 			}
 		}
-	} else {
-		acct := p.cfg.Pool.PickExcludingForRealm(nil, "", "cn")
-		if acct == nil {
-			noAcct = true
-		} else {
-			var err error
-			infos, err = p.cfg.Upstream.FetchModels(acct)
-			if err != nil {
-				writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
-				return
+	}
+
+	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
+	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
+	if p.cfg.Upstream.GlobalEnabled {
+		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
+			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
+				if len(infos) == 0 {
+					// 窄表形态 / 富字段缺失：退化为裸 ID 名单（不编造字段），与
+					// /v1/models 的 global 分支同口径；共享同一次探测缓存，零额外上游调用。
+					for _, id := range p.cfg.Upstream.FetchGlobalModels(acct) {
+						infos = append(infos, upstream.ModelInfo{ID: id})
+					}
+				}
+				// 覆盖表要在"判空"之前套用：extra_global 可能正是唯一来源
+				// （上游目录把某模型过滤掉、但实际可调）。
+				infos = p.applyModelOverrides("global", infos)
+				if len(infos) == 0 {
+					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
+				} else {
+					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
+					for _, mi := range infos {
+						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
+					}
+				}
 			}
 		}
 	}
-	if noAcct {
+
+	if len(out) == 0 {
+		if len(fetchErrs) > 0 {
+			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
+			return
+		}
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
-	// 运维补充/屏蔽表（config.models，零值=不改动）：与 /v1/models 同口径——
-	// 先按 Hide 剔除、再按 Extra 追加。面板展示的名单即客户端实际拿到的名单。
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// applyModelOverrides 把 config.models 里**对应域**的补充/屏蔽表套用到该域模型列表上：
+// 先按 Hide 剔除、再按 Extra 追加。与 /v1/models 同口径（handler.applyCNModelOverrides
+// 是同一套语义的 CN 版）——面板展示的名单即客户端实际拿到的名单。
+//
+// 必须返回**新切片**：FetchGlobalModelInfos / FetchGlobalModels 可能返回内部缓存切片，
+// 就地改写会污染缓存（与 handler.applyCNModelOverrides 的注意事项同源）。
+//
+// 补充项的元数据走三级查找（本 realm 全量目录 → CN 同名回落 → 静态种子表），
+// 与 /v1/models 共用 upstream.Client.CatalogOrSeed **同一份实现**。
+// 🔴 不要在这里再内联一份 —— 2026-09-21 round6 就因为 handler/panel 各写一份，
+// 给 handler 加第三级时漏改面板，导致两侧字段不一致。
+func (p *Panel) applyModelOverrides(realm string, infos []upstream.ModelInfo) []upstream.ModelInfo {
 	ov := p.cfg.ModelsCN
 	if realm == "global" {
 		ov = p.cfg.ModelsGlobal
 	}
-	if !ov.IsZero() {
-		ids := make([]string, 0, len(infos))
-		byID := make(map[string]upstream.ModelInfo, len(infos))
-		for _, mi := range infos {
-			ids = append(ids, mi.ID)
-			byID[mi.ID] = mi
-		}
-		res := make([]upstream.ModelInfo, 0, len(ids)+len(ov.Extra))
-		for _, id := range ov.Apply(ids) {
-			if mi, ok := byID[id]; ok {
-				res = append(res, mi)
-				continue
-			}
-			// 补充项：三级查找（本 realm 全量目录 → CN 同名回落 → 静态种子表），
-			// 与 /v1/models 共用 upstream.Client.CatalogOrSeed **同一份实现**。
-			// 🔴 不要在这里再内联一份 —— 2026-09-21 round6 就因为 handler/panel
-			// 各写一份，给 handler 加第三级时漏改面板，导致两侧字段不一致。
-			if mi, ok := p.cfg.Upstream.CatalogOrSeed(realm, id); ok {
-				res = append(res, mi)
-				continue
-			}
-			res = append(res, upstream.ModelInfo{ID: id}) // 三级全查不到：裸 ID（不编造字段）
-		}
-		infos = res
+	if ov.IsZero() {
+		return infos
 	}
-	out := make([]map[string]any, 0, len(infos))
+	ids := make([]string, 0, len(infos))
+	byID := make(map[string]upstream.ModelInfo, len(infos))
 	for _, mi := range infos {
-		entry := map[string]any{
-			"id":                   mi.ID,
-			"name":                 mi.Name,
-			"default_effort":       mi.DefaultEffort,
-			"supported_efforts":    mi.Efforts,
-			"can_disable_thinking": mi.CanDisableThinking,
-			"supports_reasoning":   mi.SupportsReasoning,
-			"supports_images":      mi.SupportsImages,
-			"credits":              mi.Credits,
-			"description":          mi.Description,
-			"tags":                 mi.Tags,
-			"vendor":               mi.Vendor,
-			"is_default":           mi.IsDefault,
-			"supports_tool_call":   mi.SupportsToolCall,
-			"only_reasoning":       mi.OnlyReasoning,
-			"reasoning_effort":     mi.ReasoningEffort,
-			"reasoning_summary":    mi.ReasoningSummary,
-		}
-		if mi.MaxAllowedSize > 0 {
-			entry["max_allowed_size"] = mi.MaxAllowedSize
-		}
-		// 与 /v1/models 同口径：context_length / max_output_tokens 走四级查找链
-		// （上游动态值 → 静态知识表 → model.json → models.dev → 1M 兜底），
-		// effort 档位走 EffortListing（远端权威 ∪ CN 静态兜底表）——面板展示的
-		// 数值即客户端实际拿到的数值，两侧不再漂移。
-		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, p.cfg.Upstream.HTTP)
-		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
-			entry["max_output_tokens"] = mo
-		}
-		if efforts, def := upstream.EffortListing(realm, mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
-			entry["supported_efforts"] = efforts
-			if def != "" {
-				entry["default_effort"] = def
-			}
-		}
-		out = append(out, entry)
+		ids = append(ids, mi.ID)
+		byID[mi.ID] = mi
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "realm": realm, "models": out})
+	res := make([]upstream.ModelInfo, 0, len(ids)+len(ov.Extra))
+	for _, id := range ov.Apply(ids) {
+		if mi, ok := byID[id]; ok {
+			res = append(res, mi)
+			continue
+		}
+		if mi, ok := p.cfg.Upstream.CatalogOrSeed(realm, id); ok {
+			res = append(res, mi)
+			continue
+		}
+		res = append(res, upstream.ModelInfo{ID: id}) // 三级全查不到：裸 ID（不编造字段）
+	}
+	return res
+}
+
+// panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
+// context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
+// EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
+func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
+	entry := map[string]any{
+		"id":                   realm + ":" + mi.ID,
+		"name":                 mi.Name,
+		"default_effort":       mi.DefaultEffort,
+		"supported_efforts":    mi.Efforts,
+		"can_disable_thinking": mi.CanDisableThinking,
+		"supports_reasoning":   mi.SupportsReasoning,
+		"supports_images":      mi.SupportsImages,
+		"credits":              mi.Credits,
+		"description":          mi.Description,
+		"tags":                 mi.Tags,
+		"vendor":               mi.Vendor,
+		"is_default":           mi.IsDefault,
+		"supports_tool_call":   mi.SupportsToolCall,
+		"only_reasoning":       mi.OnlyReasoning,
+		"reasoning_effort":     mi.ReasoningEffort,
+		"reasoning_summary":    mi.ReasoningSummary,
+	}
+	if mi.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = mi.MaxAllowedSize
+	}
+	entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, httpc)
+	if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, httpc); ok {
+		entry["max_output_tokens"] = mo
+	}
+	if efforts, def := upstream.EffortListing(realm, mi.ID, remoteEfforts, remoteDefault); efforts != nil {
+		entry["supported_efforts"] = efforts
+		if def != "" {
+			entry["default_effort"] = def
+		}
+	}
+	return entry
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
@@ -699,8 +731,9 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
-// 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。
+// usage 返回逐请求用量聚合。hours 查询参数控制统计窗口（默认 72，上限 1440=60
+// 天）：卡片汇总/按域/按账号/按模型/时序**全部**按该窗口统计。显式 hours=0 表示
+// 全部历史（含 90 天前折叠出的日桶，看长期趋势）。
 func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Usage == nil {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
@@ -708,7 +741,7 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	}
 	hours := 72
 	if v := r.URL.Query().Get("hours"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			hours = n
 		}
 	}

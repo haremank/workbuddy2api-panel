@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,10 +27,28 @@ type probeResp struct {
 // 余额刷新走 billing 接口，body 里是 PageNumber/ProductCode 之类）走 nonChat。
 // 不区分这两类会让"余额刷新"永远拿到 chat 的 SSE 响应 ⇒ 解析失败，测不出写回效果。
 type probeRoundTripper struct {
-	byModel  map[string]probeResp
-	nonChat  *probeResp // nil = 200 + 空 SSE（等价于"余额查询失败"）
-	calls    []string   // 收到的 model 名（chat 请求）；非 chat 记 ""
-	nonChats int        // 非 chat 请求计数
+	byModel map[string]probeResp
+	nonChat *probeResp // nil = 200 + 空 SSE（等价于"余额查询失败"）
+
+	// mu 保护 calls / nonChats：探针按 probeMaxConcurrency(=3) 并发跑，裸 append
+	// 会丢记录（2026-09-22 全量测试偶发失败即此竞态）。测试侧一律经下方访问器读。
+	mu       sync.Mutex
+	calls    []string // 收到的 model 名（chat 请求）；非 chat 记 ""
+	nonChats int      // 非 chat 请求计数
+}
+
+// callsSnapshot 返回已记录的 model 名副本（含非 chat 请求的空串）。并发安全。
+func (f *probeRoundTripper) callsSnapshot() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// nonChatCount 返回非 chat 请求数（余额查询等）。并发安全。
+func (f *probeRoundTripper) nonChatCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nonChats
 }
 
 func (f *probeRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -41,15 +60,19 @@ func (f *probeRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 
 	if req.Model == "" {
 		// 非 chat（余额查询等）
+		f.mu.Lock()
 		f.nonChats++
 		f.calls = append(f.calls, "")
+		f.mu.Unlock()
 		if f.nonChat != nil {
 			return mkProbeResp(*f.nonChat), nil
 		}
 		return mkProbeResp(probeResp{200, "data: {}\n\n"}), nil
 	}
 
+	f.mu.Lock()
 	f.calls = append(f.calls, req.Model)
+	f.mu.Unlock()
 	res, ok := f.byModel[req.Model]
 	if !ok {
 		res = probeResp{200, "data: {\"choices\":[]}\n\n"}
@@ -140,8 +163,8 @@ func TestProbeDoesNotRunByItself(t *testing.T) {
 	if rows, ok := out["rows"].([]any); ok && len(rows) != 0 {
 		t.Errorf("未点过开始，不应有结果行，实际 %d 行", len(rows))
 	}
-	if len(fake.calls) != 0 {
-		t.Errorf("未点过开始，不应有任何上游调用，实际 %d 次: %v", len(fake.calls), fake.calls)
+	if cs := fake.callsSnapshot(); len(cs) != 0 {
+		t.Errorf("未点过开始，不应有任何上游调用，实际 %d 次: %v", len(cs), cs)
 	}
 }
 
@@ -202,13 +225,13 @@ func TestProbeRealCallAndClassification(t *testing.T) {
 	// 真实调用：4 个模型都应打到上游（顺序不定，用集合比较）。
 	// fake.calls 还会记下 14018 触发的余额刷新请求（该请求无 model 字段）⇒ 按空名过滤。
 	var chatCalls []string
-	for _, c := range fake.calls {
+	for _, c := range fake.callsSnapshot() {
 		if c != "" {
 			chatCalls = append(chatCalls, c)
 		}
 	}
 	if len(chatCalls) != 4 {
-		t.Errorf("上游 chat 调用数=%d want 4（必须真实发出去）: %v", len(chatCalls), fake.calls)
+		t.Errorf("上游 chat 调用数=%d want 4（必须真实发出去）: %v", len(chatCalls), fake.callsSnapshot())
 	}
 	sum, _ := st["summary"].(map[string]any)
 	if sum["ok"].(float64) != 1 || sum["hard_credit"].(float64) != 1 || sum["model_rate"].(float64) != 1 {
@@ -242,8 +265,8 @@ func TestProbeRealmPrefixFiltersAccounts(t *testing.T) {
 		t.Errorf("realm=%v want global", row["realm"])
 	}
 	// 上游收到的必须是**去前缀**的裸模型名
-	if len(fake.calls) != 1 || fake.calls[0] != "hy4-preview-f" {
-		t.Errorf("上游应收到裸模型名 hy4-preview-f，实际 %v", fake.calls)
+	if cs := fake.callsSnapshot(); len(cs) != 1 || cs[0] != "hy4-preview-f" {
+		t.Errorf("上游应收到裸模型名 hy4-preview-f，实际 %v", cs)
 	}
 }
 
@@ -259,8 +282,8 @@ func TestProbeBareModelRunsOnBothRealms(t *testing.T) {
 		t.Fatalf("total=%v want 2", out["total"])
 	}
 	waitProbeDone(t, p)
-	if len(fake.calls) != 2 {
-		t.Errorf("上游调用=%d want 2", len(fake.calls))
+	if cs := fake.callsSnapshot(); len(cs) != 2 {
+		t.Errorf("上游调用=%d want 2", len(cs))
 	}
 }
 
@@ -300,8 +323,8 @@ func TestProbeRejectsTooManyPairs(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("20x20=400 组合应被拒，实际 %d", rec.Code)
 	}
-	if len(fake.calls) != 0 {
-		t.Errorf("被拒时不应发出任何上游调用，实际 %d", len(fake.calls))
+	if cs := fake.callsSnapshot(); len(cs) != 0 {
+		t.Errorf("被拒时不应发出任何上游调用，实际 %d", len(cs))
 	}
 }
 
@@ -392,10 +415,10 @@ func TestProbeNoAutoRunAfterFinish(t *testing.T) {
 
 	probeDo(t, p, "POST", "/panel/api/probe/start", `{"models":["hy3"]}`)
 	waitProbeDone(t, p)
-	n := len(fake.calls)
+	n := len(fake.callsSnapshot())
 	time.Sleep(200 * time.Millisecond) // 给"自动重跑"机会
-	if len(fake.calls) != n {
-		t.Errorf("跑完后不应自动再跑：先前 %d 次，现在 %d 次", n, len(fake.calls))
+	if now := len(fake.callsSnapshot()); now != n {
+		t.Errorf("跑完后不应自动再跑：先前 %d 次，现在 %d 次", n, now)
 	}
 	_, out := probeDo(t, p, "GET", "/panel/api/probe/status", "")
 	if running, _ := out["running"].(bool); running {
@@ -453,7 +476,7 @@ func TestProbeAppliesResultsToPool(t *testing.T) {
 	}
 	row := rows[0].(map[string]any)
 	t.Logf("applied=%q nonChats=%d available=%v",
-		row["applied"], fake.nonChats, p.cfg.Pool.AvailableUIDs())
+		row["applied"], fake.nonChatCount(), p.cfg.Pool.AvailableUIDs())
 	applied, _ := row["applied"].(string)
 	if applied == "" {
 		t.Errorf("14018 后应有写回动作描述，实际为空：%v", row)
@@ -461,7 +484,7 @@ func TestProbeAppliesResultsToPool(t *testing.T) {
 	if !strings.Contains(applied, "12h") {
 		t.Errorf("写回描述必须写明有效期，实际 %q", applied)
 	}
-	if fake.nonChats == 0 {
+	if fake.nonChatCount() == 0 {
 		t.Error("14018 应查一次余额（自校验：余额仍有则不该出池）")
 	}
 	for _, u := range p.cfg.Pool.AvailableUIDs() {
@@ -543,8 +566,8 @@ func TestProbeDoesNotWriteBackOnAmbiguous(t *testing.T) {
 	if mcs := p.cfg.Pool.ModelCooldowns(uid); len(mcs) != 0 {
 		t.Errorf("5xx 不应产生模型冷却，实际 %v", mcs)
 	}
-	if fake.nonChats != 0 {
-		t.Errorf("5xx 不应触发余额刷新，实际 %d 次", fake.nonChats)
+	if n := fake.nonChatCount(); n != 0 {
+		t.Errorf("5xx 不应触发余额刷新，实际 %d 次", n)
 	}
 }
 

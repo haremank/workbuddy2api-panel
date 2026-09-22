@@ -329,13 +329,12 @@ function outCell(m, pr) {
 
 async function loadModels() {
   const tb = $('mdBody');
-  // realm 分池（2026-09-21 修，WB2API-REALM-FIX）：CN 与 global 的目录由各自的
-  // 账号拉取，必须显式指定 realm，否则服务端缺省 cn、国际版目录看不到。
-  const realm = ($('mdRealm') && $('mdRealm').value) || 'cn';
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
-    // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models?realm=' + encodeURIComponent(realm)), api('model_probes').catch(() => ({}))]);
+    // 探测数据是可选增强：拉取失败不影响模型列表本身。
+    // 模型列表一次拿双域（服务端已按 realm 分别取号、各域独立容错，id 带 cn:/global: 前缀），
+    // 所以前端不再需要 realm 选择器 —— 旧的 ?realm= 参数已被服务端忽略（会静默失效）。
+    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
     const list = d.models || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
@@ -362,14 +361,12 @@ async function loadModels() {
         outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
     const hit = list.filter(m => probeOf(m.id)).length;
-    $('mdNote').textContent = (realm === 'global' ? 'global · 国际版' : 'CN · 国内版') + ' · ' + list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
 $('btnModels').onclick = loadModels;
-// realm 切换即重查（两域目录来源不同，不能复用上一次结果）。
-if ($('mdRealm')) $('mdRealm').onchange = loadModels;
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
@@ -415,11 +412,11 @@ const CFG_MAP = {
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
-  max_body_mb: ['server', 'max_body_mb'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
   degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
+  cost_explore_interval: ['pool', 'cost_explore_interval'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
@@ -479,7 +476,7 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'ttl'];
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'ttl'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
@@ -535,14 +532,24 @@ $('cfgForm').onsubmit = async ev => {
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');
-  // 重置到选域态：选域可见、加载/就绪/完成/错误全收，起始按钮亮起。
+  // 重置到登录标签
+  switchAddTab('login');
   $('addPick').hidden = false;
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
+  $('importDone').hidden = true; $('importErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   stopPoll();
 }
+function switchAddTab(tab) {
+  document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $('addTabLogin').hidden = tab !== 'login';
+  $('addTabImport').hidden = tab !== 'import';
+}
+document.querySelectorAll('#addTabs .tab').forEach(b => {
+  b.onclick = () => switchAddTab(b.dataset.tab);
+});
 function startAddLogin() {
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
@@ -587,6 +594,31 @@ $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+$('importFile').onchange = async () => {
+  const file = $('importFile').files[0];
+  if (!file) return;
+  $('importDone').hidden = true; $('importErr').hidden = true;
+  const fd = new FormData();
+  fd.append('file', file);
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  try {
+    const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    $('importDone').hidden = false;
+    $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
+    if (d.errors && d.errors.length) {
+      console.warn('import errors:', d.errors);
+    }
+    loadOverview(true);
+  } catch (e) {
+    $('importErr').hidden = false;
+    $('importErr').textContent = '导入失败：' + e.message;
+  }
+  $('importFile').value = '';
+};
 
 /* ── 导入账号 JSON ─────────────────────────────────────────────────── */
 // 后端 /panel/api/accounts/import 接受原始 JSON 文本（不解析结构，直接转发），
@@ -998,7 +1030,9 @@ const AUTO_TASKS = {
   'Hp_Appearance': '设置主题 API + 皮肤生效事件（两账号实测点亮）',
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
-  'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）'
+  'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
+  'school_season': '校园日（小程序口径）：accept → mini 对话+activityId 上报 → 领奖（+100c+5e）',
+  'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）'
 };
 
 function openTasks(uid) {
@@ -1633,14 +1667,15 @@ function renderUsage(d) {
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟');
 
-  // 卡片与表格给的是**全部历史**的累计值，只有下面的时序图按所选窗口展示。
-  //
-  // 这是后端的既定口径（Snapshot 的注释：「聚合当前全部桶。hours 控制时序返回
-  // 多少个小时点」），不是缺陷——但界面上不写明，切 24 小时 / 30 天时这几个数字
-  // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
-  $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
+  // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
+  // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
+  const winLabel = ($('usWindow') && $('usWindow').selectedOptions[0]) ?
+    $('usWindow').selectedOptions[0].textContent.trim() : '';
+  $('usNote').textContent =
+    (winLabel ? winLabel + ' · ' : '') +
     (d.buckets || 0) + ' 个分桶' +
-    (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
+    (d.since ? ' · 数据自 ' + d.since.replace('T', ' ') : '') +
+    (d.file_bytes ? ' · 文件 ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
