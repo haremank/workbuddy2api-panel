@@ -10,6 +10,11 @@ let refTimer = null;
 // go() → pbInit()/loadQuota() → pbRenderAccts() 会立刻读到这些绑定；
 // 用 let 声明在后面会撞 TDZ（ReferenceError），页面白屏。
 let pbStatus = null, pbTimer = null;
+// 探针**模型选择**状态（同受"必须在 go() 之前声明"的 TDZ 约束）：
+//   pbModelsSig  = 常用免费档的签名；变了才重建 DOM（800ms 轮询不会冲掉用户勾选）
+//   pbMoreModels = 「更多模型」懒加载结果（按 realm 分组；null = 还没拉过，false = 拉失败）
+//   pbMoreOpen   = 「更多模型」是否展开
+let pbModelsSig = '', pbMoreModels = null, pbMoreOpen = false;
 
 const $ = id => document.getElementById(id);
 
@@ -797,12 +802,57 @@ $('btnQuotaRefresh').onclick = async () => {
      · 进入本页只做一次只读的 probe/status（用于回填模型预填 + 显示上次结果），
        不会触发任何上游调用。
      · 账号勾选只在账号集合变化时重建，避免 5s 轮询把用户的勾选冲掉。
-   默认探测档按 **realm** 分流（国内/国际不一样，用户 2026-09-21 指定），所以模型框
-   **留空是推荐用法** —— 由后端按每个账号所属域取 default_models，JS 只负责把这份
-   默认说明显示出来（抄一份到 JS 里必漂移）。 */
+   模型选择：**勾选式，没有手输**（用户 2026-09-22 要求：「列出常用的几个免费模型，
+   还有更多可以选择其他的，不要让我手动输入了」）——
+     · 「常用免费档」= 后端 probe/status 的 default_models（`probeRealmModels` 的镜像），
+       默认勾选；**不在 JS 里抄常量表**（抄一份必漂移：round6 那次「后端删字段、前端还在读」
+       就是这么静默失效的，所以这里连字段名都不写死）。
+     · 「更多模型」= 展开时懒拉 `/panel/api/models?realm=cn|global`，按 realm 加前缀后列出，
+       默认不勾；带一个纯前端筛选框（过滤显示，不是输入模型名）。
+   后端 `probeStart` 对 models 做去重（normalizeProbeModels），所以同一 spec 在两个组里
+   各勾一次也只会跑一次。 */
 
+// pbModelsList 当前勾选的模型（**全部来自复选框，无手输路径**）。
 function pbModelsList() {
-  return ($('pbModels').value || '').split('\n').map(s => s.trim()).filter(Boolean);
+  return Array.prototype.map.call(
+    document.querySelectorAll('#pbModels input[type=checkbox]:checked, #pbModelsMore input[type=checkbox]:checked'),
+    c => c.value);
+}
+// pbSpecLabel 渲染一个 `realm:model` 勾选项（域角标 + 免费角标）。
+function pbSpecLabel(spec, free) {
+  const i = spec.indexOf(':');
+  const realm = i > 0 ? spec.slice(0, i) : '';
+  const bare = i > 0 ? spec.slice(i + 1) : spec;
+  const rt = realm === 'global' ? '<span class="hint" style="font-size:11px">国际</span>'
+    : (realm === 'cn' ? '<span class="hint" style="font-size:11px">国内</span>' : '');
+  return '<label><input type="checkbox" value="' + esc(spec) + '"' + (free ? ' checked' : '') + '>' +
+    '<span>' + esc(bare) + '</span>' + rt + (free ? '<span class="free">免费</span>' : '') + '</label>';
+}
+// pbFreeSpecs 常用免费档 = 后端 default_models 派生（cn 档 + global 档，去重保序）。
+// 前端**只做展示**，不新增/删除任何模型 —— 名单的单一来源始终在后端。
+function pbFreeSpecs() {
+  const dm = (pbStatus && pbStatus.default_models) || {};
+  const out = [];
+  ['cn', 'global'].forEach(r => (dm[r] || []).forEach(m => {
+    const spec = m.indexOf(':') > 0 ? m : r + ':' + m;   // 后端已带前缀；没带就补
+    if (out.indexOf(spec) < 0) out.push(spec);
+  }));
+  return out;
+}
+// pbRenderModels 重建「常用免费档」组。**仅在签名变化时重建** ——
+// 否则 pbPoll 每 800ms 一次会把用户取消的勾选重新勾上。
+function pbRenderModels() {
+  const box = $('pbModels');
+  if (!box) return;
+  const specs = pbFreeSpecs();
+  const sig = specs.join(',');
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  box.innerHTML = specs.length
+    ? '<div class="grp">常用免费档（默认勾选 · 0x 档，探测不花额度）</div>' +
+      specs.map(s => pbSpecLabel(s, true)).join('')
+    : '<div class="none">后端未给出默认档 —— 展开「更多模型」自行勾选</div>';
+  pbPlan();
 }
 function pbSelectedUids() {
   return Array.prototype.map.call(
@@ -849,12 +899,51 @@ function pbPairCount() {
   });
   return n;
 }
-// pbDefaultSummary 把 default_models 说成一句人话（国内/国际各探什么）。
-function pbDefaultSummary() {
-  const dm = (pbStatus && pbStatus.default_models) || {};
-  const keys = Object.keys(dm).sort();
-  if (!keys.length) return '（未知）';
-  return keys.map(k => (k === 'global' ? '国际' : '国内') + ' ' + dm[k].join(' + ')).join('；');
+// pbRenderMore 渲染「更多模型」组（按 realm 分组 + 可选筛选）。
+// 三种状态：未展开（清空）/ 加载中 / 拉失败（给一句人话，不让用户对着空框猜）。
+function pbRenderMore() {
+  const box = $('pbModelsMore'), note = $('pbMoreNote');
+  if (!box || !note) return;
+  if (!pbMoreOpen) { box.innerHTML = ''; note.textContent = ''; return; }
+  if (pbMoreModels === null) { note.textContent = '加载中…'; box.innerHTML = ''; return; }
+  if (pbMoreModels === false) {
+    note.textContent = '模型名单拉取失败（上游不可达或该域无可用账号）';
+    box.innerHTML = ''; return;
+  }
+  const kw = ($('pbModelFilter').value || '').trim();
+  const low = kw.toLowerCase();
+  const free = pbFreeSpecs();
+  const total = ['cn', 'global'].reduce((n, r) => n + (pbMoreModels[r] || []).length, 0);
+  note.textContent = total ? '共 ' + total + ' 个模型 · 未勾选，勾上才会探' : '模型名单为空';
+  const groups = [];
+  ['cn', 'global'].forEach(r => {
+    const list = (pbMoreModels[r] || []).map(m => r + ':' + m)
+      .filter(spec => !low || spec.toLowerCase().indexOf(low) >= 0);
+    if (list.length) groups.push({ realm: r, list: list });
+  });
+  box.innerHTML = groups.length
+    ? groups.map(g => '<div class="grp">' + (g.realm === 'global' ? '国际版' : '国内版') +
+        ' · ' + g.list.length + ' 个' +
+        (g.list.some(s => free.indexOf(s) >= 0) ? '（含已在常用档的免费模型）' : '') + '</div>' +
+        g.list.map(s => pbSpecLabel(s, false)).join('')).join('')
+    : '<div class="none">没有匹配「' + esc(kw) + '」的模型</div>';
+  pbPlan();
+}
+// pbLoadMore 懒加载「更多模型」：一次拉两个 realm 的名单（用户点开才拉，不在首屏发请求）。
+// 该接口是面板既有接口（「模型与档位」页同源），命中上游 1h 缓存时零额外上游调用。
+async function pbLoadMore() {
+  if (pbMoreModels !== null) { pbRenderMore(); return; }
+  pbRenderMore();
+  try {
+    const [cn, gl] = await Promise.all([
+      api('models?realm=cn').catch(() => null),
+      api('models?realm=global').catch(() => null),
+    ]);
+    const ids = d => ((d && d.models) || []).map(m => m.id).filter(Boolean);
+    const a = ids(cn), b = ids(gl);
+    pbMoreModels = (a.length || b.length) ? { cn: a, global: b } : false;
+  } catch (e) { pbMoreModels = false; }
+  pbRenderMore();
 }
 function pbPlan() {
   const el = $('pbPlan');
@@ -865,10 +954,9 @@ function pbPlan() {
   // 别再用 max_concurrency 去除 —— 那会低估成 1/3，把「3 分钟」说成「1 分钟」。
   const iv = ((pbStatus && pbStatus.interval_ms) || 1500) / 1000;
   if (!pbModelsList().length) {
-    // 留空是推荐用法：由服务端按号分域，国内只探 cn 档、国际探 global 两档。
-    el.textContent = '模型留空 ⇒ 按域自动分流：' + pbDefaultSummary() +
-      ' · 将发起 ' + n + ' 次真实调用 · 结果写回选号器（账号级结论 12h 有效，到期自动回轮换）';
-    el.style.color = '';
+    // 常用免费档默认勾选 ⇒ 正常不会走到这里；全取消时给明确指引，别让按钮点了没反应。
+    el.textContent = '⚠️ 至少勾选一个模型（常用免费档已默认勾选；其他模型在「更多模型」里）';
+    el.style.color = 'var(--bad)';
     return;
   }
   if (!n) { el.textContent = '当前范围下没有可测组合（检查 realm: 前缀与勾选的账号域是否匹配）'; return; }
@@ -906,6 +994,7 @@ function pbRender(st) {
   const rows = st.rows || [];
   const sum = st.summary || {};
   const el = $('pbNote');
+  pbRenderModels();   // 常用档由后端 default_models 驱动；签名未变则不重建（幂等）
   if (st.running) {
     el.textContent = '进行中 ' + st.done + ' / ' + st.total + ' · ' + dur((st.elapsed_ms || 0) / 1000);
   } else if (st.total) {
@@ -921,7 +1010,7 @@ function pbRender(st) {
   $('pbBody').innerHTML = rows.length
     ? rows.map(pbRow).join('')
     : '<tr><td colspan="8"><div class="empty"><div class="big">还没有探测结果</div>' +
-      '模型留空即可（按域自动分流）——点「开始探测」才会真实调用上游，网关不会自己跑</div></td></tr>';
+      '常用免费档已默认勾选 —— 点「开始探测」才会真实调用上游，网关不会自己跑</div></td></tr>';
 }
 function pbStopPoll() { if (pbTimer) { clearInterval(pbTimer); pbTimer = null; } }
 async function pbPoll() {
@@ -951,7 +1040,7 @@ function pbStartPoll() {
 }
 $('btnProbeRun').onclick = async () => {
   const models = pbModelsList();
-  if (!models.length) return toast('请至少填一个模型', 'err');
+  if (!models.length) return toast('请至少勾选一个模型', 'err');
   const uids = pbSelectedUids();
   if (!uids.length) return toast('请至少勾一个账号', 'err');
   const n = pbPairCount();
@@ -974,7 +1063,17 @@ $('btnProbeCancel').onclick = async () => {
   catch (e) { toast('停止失败：' + e.message, 'err'); }
   pbPoll();
 };
-$('pbModels').addEventListener('input', pbPlan);
+/* 模型选择的事件接线：勾选即重算计划；「更多模型」首次展开才懒拉名单。
+   change 会从复选框冒泡到容器，所以两个容器各挂一个监听即可。 */
+$('pbModels').addEventListener('change', pbPlan);
+$('pbModelsMore').addEventListener('change', pbPlan);
+$('pbModelFilter').addEventListener('input', pbRenderMore);   // 纯前端过滤，不发请求
+$('btnPbMore').onclick = () => {
+  pbMoreOpen = !pbMoreOpen;
+  $('pbMoreWrap').hidden = !pbMoreOpen;
+  $('btnPbMore').textContent = pbMoreOpen ? '更多模型 ▴' : '更多模型 ▾';
+  if (pbMoreOpen) pbLoadMore(); else pbRenderMore();
+};
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;

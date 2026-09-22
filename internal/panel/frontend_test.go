@@ -124,6 +124,75 @@ func TestProbeUIElementsPresent(t *testing.T) {
 	}
 }
 
+// TestProbeModelPickerIsCheckboxOnly 探针的模型选择必须是**勾选式**，不允许手输。
+//
+// 用户要求（2026-09-22）：「探针那里的模型列出常用的几个免费模型，还有更多可以选择
+// 其他的，不要让我手动输入了」。四条锚点，任一条坏了都是"用户被迫手输模型名"或
+// "名单与后端漂移"：
+//  1. index.html 不能再有 <textarea id="pbModels">（手输入口），改由勾选容器承载；
+//  2. 「更多模型」三件套（按钮 / 展开容器 / 筛选框 / 列表容器）双侧在场；
+//  3. 常用档必须**由后端 default_models 派生**（pbFreeSpecs 读它），前端不得硬编码
+//     模型名 —— 否则后端改了 probeRealmModels，面板照旧列旧名单（round6 的
+//     「后端删字段、前端还在读」就是这类静默失效）；
+//  4. 「更多模型」必须补 realm 前缀：14 个同名模型跨域并存，**裸名默认走 cn**，
+//     不补前缀就会把 global 专有模型派到 cn 号上（必然 11102）。
+func TestProbeModelPickerIsCheckboxOnly(t *testing.T) {
+	html := string(indexHTML)
+	js := string(appJS)
+
+	// 1. 手输入口必须消失。
+	if strings.Contains(html, `<textarea id="pbModels"`) {
+		t.Error("index.html 的 pbModels 仍是 <textarea>：模型仍要手输（用户明确要求去掉）")
+	}
+	if !strings.Contains(html, `<div id="pbModels"`) {
+		t.Error(`index.html 缺少勾选容器 <div id="pbModels">`)
+	}
+
+	// 2. 「更多模型」的要素双侧在场（通用 $()↔id 测试也覆盖，这里给直接线索）。
+	for _, id := range []string{"btnPbMore", "pbMoreWrap", "pbModelFilter", "pbModelsMore", "pbMoreNote"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 缺少「更多模型」元素 id=%q", id)
+		}
+		if !strings.Contains(js, `$('`+id+`')`) {
+			t.Errorf("app.js 未引用 $('%s')", id)
+		}
+	}
+
+	// 3. 常用档来自后端，前端不硬编码模型名。
+	if !strings.Contains(js, "default_models") {
+		t.Error("app.js 未从 default_models 派生常用档（会与 probeRealmModels 漂移）")
+	}
+	for _, hard := range []string{
+		"'cn:deepseek-v4.1-flash'", "'global:deepseek-v4.1-flash'", "'global:hy4-preview-f'",
+	} {
+		if strings.Contains(js, hard) {
+			t.Errorf("app.js 硬编码了默认档模型名 %s（应只来自后端 default_models）", hard)
+		}
+	}
+
+	// 4. 勾选读取 + realm 前缀。
+	if !strings.Contains(js, "input[type=checkbox]:checked") {
+		t.Error("app.js 未从复选框读取勾选（可能仍在读输入框的 .value）")
+	}
+	if !strings.Contains(js, "models?realm=") {
+		t.Error("app.js 未从面板模型接口（models?realm=）拉「更多模型」名单")
+	}
+	// ⚠️ 前缀断言必须**限定在 pbRenderMore 函数体内**：`r + ':' + m` 这个片段在
+	// pbFreeSpecs（补默认档前缀）里也出现，写成全文 Contains 就会在「更多模型丢掉前缀」
+	// 时依然通过 —— 变异测试（把 .map(m => r + ':' + m) 改成 .map(m => m)）实测确认过。
+	moreStart := strings.Index(js, "function pbRenderMore() {")
+	if moreStart < 0 {
+		t.Fatal("app.js 缺少 pbRenderMore（「更多模型」渲染入口）")
+	}
+	moreBody := js[moreStart:]
+	if i := strings.Index(moreBody, "\n}"); i >= 0 {
+		moreBody = moreBody[:i]
+	}
+	if !strings.Contains(moreBody, "r + ':' + m") {
+		t.Error("pbRenderMore 未给「更多模型」补 realm 前缀（裸名默认走 cn，会与所选账号域不匹配）")
+	}
+}
+
 // TestProbeWritebackUIContract 探针「写回选号器」这一列的契约（2026-09-21 新增）：
 // 后端 probeRow.Applied → 表头一列 → 前端渲染，三处必须同时在场。
 //

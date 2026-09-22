@@ -242,6 +242,15 @@ textarea:focus { outline: none; border-color: var(--accent); }
 textarea.mono { font-family: var(--mono); font-size: 12px; }
 .file-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .file-row input[type=file] { font-size: 12.5px; color: var(--ink-2); max-width: 100%; }
+/* 探针模型选择：勾选式（常用免费档预勾选 + 「更多模型」可展开）。
+   与 .realm-opt 同视觉，避免两套复选框观感。 */
+.pb-models { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.pb-models .grp { flex: 0 0 100%; font-size: 11.5px; color: var(--ink-3); margin: 4px 0 0; }
+.pb-models label { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+.pb-models input { accent-color: var(--accent); margin: 0; }
+.pb-models .free { font-size: 10.5px; color: var(--ok); }
+.pb-models .none { font-size: 12px; color: var(--ink-3); }
+#pbModelsMore { max-height: 190px; overflow: auto; padding-right: 4px; }
 .imp-list { margin-top: 12px; max-height: 240px; overflow: auto; }
 .imp-list table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .imp-list th { text-align: left; color: var(--ink-3); font-weight: 500; padding: 5px 8px; border-bottom: 1px solid var(--line-soft); }
@@ -551,10 +560,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs primary" id="btnProbeRun">开始探测</button>
         </header>
         <div class="pad">
-          <div class="file-row">
-            <span class="hint" style="font-size:12px;min-width:64px">模型</span>
-            <textarea id="pbModels" class="mono" rows="6" spellcheck="false"
-              placeholder="每行一个模型名，支持 realm:model 前缀（如 global:hy4-preview-f）。留空 = 按域自动分流：国内版只探 cn:deepseek-v4.1-flash，国际版探 deepseek-v4.1-flash + hy4-preview-f（都是 0x 免费档，探测不花额度）"></textarea>
+          <div class="file-row" style="align-items:flex-start">
+            <span class="hint" style="font-size:12px;min-width:64px;padding-top:3px">模型</span>
+            <div style="flex:1;min-width:0">
+              <!-- 模型选择**只许勾选，不许手输**（2026-09-22 用户要求：
+                   「列出常用的几个免费模型，还有更多可以选择其他的，不要让我手动输入了」）。
+                   常用档由后端 probe/status 的 default_models 驱动（后端 probeRealmModels 的镜像），
+                   **不在 JS 里抄一份** —— 抄一份必漂移（round6 的 free_tier 就是这么静默失效的）。 -->
+              <div id="pbModels" class="pb-models"></div>
+              <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <button class="xs" id="btnPbMore" type="button">更多模型 ▾</button>
+                <span class="hint" id="pbMoreNote" style="font-size:11.5px"></span>
+              </div>
+              <div id="pbMoreWrap" hidden style="margin-top:8px">
+                <input id="pbModelFilter" class="mono" type="text" spellcheck="false"
+                  placeholder="筛选模型名（可选，不区分大小写）" style="width:100%;margin-bottom:8px">
+                <div id="pbModelsMore" class="pb-models"></div>
+              </div>
+            </div>
           </div>
           <div class="file-row" style="align-items:flex-start">
             <span class="hint" style="font-size:12px;min-width:64px;padding-top:3px">账号范围</span>
